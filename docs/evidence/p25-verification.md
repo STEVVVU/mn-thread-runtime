@@ -40,4 +40,3 @@ These sub-millisecond synthetic timings do not show whether locality scheduling 
 # Hosted verification
 
 At source head `53aadbd6b185ee6765b7048a9388c6afa3bd1380`, [run 39716823237](https://github.com/STEVVVU/mn-thread-runtime/actions/runs/39716823237) passed both `CMake / windows-latest` and `CMake / ubuntu-latest`. Both jobs initialized the existing pinned GoogleTest gitlink, built the real consumer and upstream tests, and reported two of two CTest entries passed. These checks establish runtime correctness for the covered cases, without a performance conclusion.
-
