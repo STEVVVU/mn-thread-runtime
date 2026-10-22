@@ -47,3 +47,17 @@ five-repeat native framework run.
 The pinned implementation already supports these flags and APIs. See its
 [command flags](https://github.com/google/benchmark/blob/2dd015dfef425c866d9a43f2c67d8b52d709acb6/src/benchmark.cc)
 and [timing APIs](https://github.com/google/benchmark/blob/2dd015dfef425c866d9a43f2c67d8b52d709acb6/include/benchmark/benchmark.h).
+
+For the reviewed shared-pointer move candidate, `framework=true` now compares
+frozen `db6ecf6d62de6a20533077ce5c5c352d8b2fd42b` and current source on one
+hosted runner. Both use the same pinned GoogleTest/Google Benchmark revisions,
+identical maintained fixture/helper files, Release compiler/toolchain and
+unchanged consumer/upstream CTest checks before measurement. Five whole passes
+per build alternate order; each preserves five native randomly interleaved
+repetitions with 0.1-second warmup and 0.5-second calibration, yielding 300
+iteration rows on a four-logical-CPU runner. Every pass keeps native JSON/logs,
+an exact command, GNU time resources and an exit receipt under a 180-second
+timeout. Exact source, fixture and binary hashes and actual pass order are
+retained. An atomic false-default terminal receipt covers failure and owned
+temporary-source cleanup. Original standalone runs remain retained; only the
+matched comparison can support a claim about this candidate's timing effect.

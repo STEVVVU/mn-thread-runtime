@@ -1,0 +1,16 @@
+{
+  "run_id": 39735074674,
+  "source_sha": "db6ecf6d62de6a20533077ce5c5c352d8b2fd42b",
+  "framework_sha": "2dd015dfef425c866d9a43f2c67d8b52d709acb6",
+  "binary_sha256": "70a1fceecedc4c405073eefc4578f13a54c6dab7af43f6fa68952316ed0b962a",
+  "batches_per_mode": 256,
+  "callbacks_per_batch": 512,
+  "callbacks_per_mode": 131072,
+  "ordinary_instructions": 111151455,
+  "hinted_instructions": 175420970,
+  "hinted_over_ordinary_instructions": 1.5782156877748474,
+  "ordinary_operator_new_calls": 132289,
+  "hinted_operator_new_calls": 263361,
+  "native_timing_comparison": false,
+  "purpose": "Separate diagnostic; full process includes startup and final drain, instrumented timing excluded"
+}

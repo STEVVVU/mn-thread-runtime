@@ -14,7 +14,7 @@ on:
         type: boolean
         default: false
       framework:
-        description: Run the pinned Google Benchmark hinted fork/join cases
+        description: Compare frozen and current scheduler with pinned Google Benchmark
         type: boolean
         default: false
       framework_profile:
@@ -53,7 +53,7 @@ jobs:
   metrics:
     if: inputs.metrics || inputs.profile_only || inputs.framework || inputs.framework_profile
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - run: git submodule update --init third_party/googletest
@@ -61,26 +61,97 @@ jobs:
         run: git submodule update --init third_party/benchmark
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMARL_BUILD_EXAMPLES=ON -DMARL_BUILD_TESTS=ON -DMARL_BUILD_BENCHMARKS=${{ (inputs.framework || inputs.framework_profile) && 'ON' || 'OFF' }}
       - run: cmake --build build --parallel 2 --target mn_thread_runtime_tests marl-unittests
-      - run: ctest --test-dir build --output-on-failure --timeout 120
+      - name: Consumer and upstream checks before measurement
+        shell: bash
+        run: |
+          mkdir -p .agents/runs/metrics-${{ github.run_id }}
+          ctest --test-dir build --output-on-failure --timeout 120 2>&1 | tee .agents/runs/metrics-${{ github.run_id }}/candidate-tests.log
       - if: ${{ !inputs.profile_only && !inputs.framework && !inputs.framework_profile }}
         run: python3 .agents/skills/verify-mn-thread-runtime/scripts/metrics.py --exe build/mn_thread_runtime_tests --output .agents/runs/metrics-${{ github.run_id }}
-      - name: Pinned Google Benchmark scheduling comparison
+      - name: Matched pinned Google Benchmark scheduling comparison
         if: inputs.framework
         shell: bash
         run: |
           evidence=".agents/runs/metrics-${{ github.run_id }}"
           mkdir -p "$evidence"
+          baseline="$RUNNER_TEMP/marl-baseline-${GITHUB_RUN_ID}"
+          baseline_owned=false
+          frozen=db6ecf6d62de6a20533077ce5c5c352d8b2fd42b
+          printf '{"passed":false,"details":"matched comparison not completed"}\n' > "$evidence/framework-result.json"
+          finish_framework() {
+            status=$?
+            trap - EXIT
+            cleanup=true
+            if [ "$baseline_owned" = true ] && [ -d "$baseline" ]; then
+              if [ "$baseline" = "$RUNNER_TEMP/marl-baseline-${GITHUB_RUN_ID}" ]; then
+                rm -rf -- "$baseline" || cleanup=false
+              else cleanup=false; fi
+            fi
+            if [ "$cleanup" != true ]; then status=1; fi
+            python3 -c 'import json,os,sys; status=int(sys.argv[1]); cleanup=sys.argv[2]=="true"; p=sys.argv[3]; temporary=p+".tmp"; json.dump(dict(passed=status==0 and cleanup,exit_code=status,cleanup_complete=cleanup,baseline_source="db6ecf6d62de6a20533077ce5c5c352d8b2fd42b",candidate_source=os.environ["GITHUB_SHA"],passes_per_source=5,native_repeats_per_case=5,callbacks_per_batch=512,calibration_seconds=0.5,warmup_seconds=0.1),open(temporary,"w"),indent=2); os.replace(temporary,p)' "$status" "$cleanup" "$evidence/framework-result.json"
+            exit "$status"
+          }
+          trap finish_framework EXIT
+          df -B1 "$RUNNER_TEMP" "$GITHUB_WORKSPACE" > "$evidence/framework-disk-before.txt"
+          test "$(df --output=avail -B1 "$RUNNER_TEMP" | tail -n 1)" -ge 10737418240
+          test ! -e "$baseline"
+          mkdir "$baseline"
+          baseline_owned=true
+          git -C "$baseline" init
+          git -C "$baseline" fetch --depth=1 --no-tags "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$frozen"
+          git -C "$baseline" checkout --detach FETCH_HEAD
+          test "$(git -C "$baseline" rev-parse HEAD)" = "$frozen"
+          git -C "$baseline" submodule update --init third_party/googletest third_party/benchmark
+          for module in googletest benchmark; do
+            test "$(git -C "$baseline/third_party/$module" rev-parse HEAD)" = "$(git -C "third_party/$module" rev-parse HEAD)"
+          done
+          cmp src/scheduler_bench.cpp "$baseline/src/scheduler_bench.cpp"
+          cmp src/marl_bench.h "$baseline/src/marl_bench.h"
           cmake --build build --parallel 2 --target marl-benchmarks
-          { git rev-parse HEAD; git submodule status third_party/benchmark; lscpu; c++ --version; sha256sum build/marl-benchmarks; } > "$evidence/framework-environment.txt"
-          timeout 180 build/marl-benchmarks --benchmark_filter='^Schedule/HintedForkJoin/' --benchmark_min_time=0.5s --benchmark_min_warmup_time=0.1 --benchmark_repetitions=5 --benchmark_enable_random_interleaving=true --benchmark_out="$evidence/google-benchmark.json" --benchmark_out_format=json > "$evidence/google-benchmark.log" 2>&1
-          python3 - "$evidence/google-benchmark.json" <<'PY'
-          import collections, json, math, os, sys
-          data = json.load(open(sys.argv[1]))
-          rows = [row for row in data['benchmarks'] if row['run_type'] == 'iteration']
-          expected = 2 * sum(n <= os.cpu_count() for n in (1, 2, 4))
-          counts = collections.Counter(row['run_name'] for row in rows)
-          assert len(counts) == expected and all(n == 5 for n in counts.values())
-          assert all(not row.get('error_occurred') and all(math.isfinite(row[key]) and row[key] > 0 for key in ('real_time', 'cpu_time', 'items_per_second')) for row in rows)
+          cmake -S "$baseline" -B "$baseline/build" -DCMAKE_BUILD_TYPE=Release -DMARL_BUILD_EXAMPLES=ON -DMARL_BUILD_TESTS=ON -DMARL_BUILD_BENCHMARKS=ON
+          cmake --build "$baseline/build" --parallel 2 --target mn_thread_runtime_tests marl-unittests marl-benchmarks
+          ctest --test-dir "$baseline/build" --output-on-failure --timeout 120 > "$evidence/baseline-tests.log" 2>&1
+          df -B1 "$RUNNER_TEMP" "$GITHUB_WORKSPACE" > "$evidence/framework-disk-after-build.txt"
+          test "$(df --output=avail -B1 "$RUNNER_TEMP" | tail -n 1)" -ge 10737418240
+          { printf 'baseline_source=%s\ncandidate_source=%s\n' "$frozen" "$GITHUB_SHA"; git submodule status third_party/googletest third_party/benchmark; git -C "$baseline" submodule status third_party/googletest third_party/benchmark; lscpu; c++ --version; cmake --version; sha256sum src/scheduler_bench.cpp src/marl_bench.h "$baseline/src/scheduler_bench.cpp" "$baseline/src/marl_bench.h" build/marl-benchmarks "$baseline/build/marl-benchmarks"; } > "$evidence/framework-environment.txt"
+          failed=0
+          for repeat in 1 2 3 4 5; do
+            order="baseline candidate"
+            if (( repeat % 2 == 0 )); then order="candidate baseline"; fi
+            for variant in $order; do
+              exe="build/marl-benchmarks"
+              if [ "$variant" = baseline ]; then exe="$baseline/$exe"; fi
+              prefix="$evidence/google-benchmark-$variant-$repeat"
+              printf '%s %s\n' "$repeat" "$variant" >> "$evidence/framework-pass-order.txt"
+              command=(/usr/bin/time -v -o "$prefix.resources.txt" timeout 180 "$exe" '--benchmark_filter=^Schedule/HintedForkJoin/' --benchmark_min_time=0.5s --benchmark_min_warmup_time=0.1 --benchmark_repetitions=5 --benchmark_enable_random_interleaving=true --benchmark_out="$prefix.json" --benchmark_out_format=json)
+              printf '%q ' "${command[@]}" > "$prefix.command.txt"
+              set +e
+              "${command[@]}" > "$prefix.log" 2>&1
+              status=$?
+              set -e
+              python3 -c 'import json,sys; json.dump(dict(passed=int(sys.argv[1])==0,exit_code=int(sys.argv[1]),variant=sys.argv[2],pass_index=int(sys.argv[3])),open(sys.argv[4],"w"),indent=2)' "$status" "$variant" "$repeat" "$prefix.result.json"
+              if [ "$status" -ne 0 ]; then failed=1; fi
+            done
+          done
+          test "$failed" -eq 0
+          python3 - "$evidence" <<'PY'
+          import collections, json, math, os, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          expected = {f'Schedule/HintedForkJoin/tasks:512/threads:{workers}/hinted:{hinted}/process_time/real_time' for workers in (1, 2, 4) if workers <= os.cpu_count() for hinted in (0, 1)}
+          for variant in ('baseline', 'candidate'):
+              for repeat in range(1, 6):
+                  prefix = root / f'google-benchmark-{variant}-{repeat}'
+                  receipt = json.loads(prefix.with_suffix('.result.json').read_text())
+                  assert receipt['passed'] is True and receipt['exit_code'] == 0
+                  data = json.loads(prefix.with_suffix('.json').read_text())
+                  rows = [row for row in data['benchmarks'] if row['run_type'] == 'iteration']
+                  counts = collections.Counter(row['run_name'] for row in rows)
+                  assert set(counts) == expected and all(n == 5 for n in counts.values())
+                  for row in rows:
+                      assert not row.get('error_occurred') and row['iterations'] > 0
+                      assert row['time_unit'] == 'ns' and row['repetitions'] == 5
+                      assert all(math.isfinite(row[key]) and row[key] > 0 for key in ('real_time', 'cpu_time', 'items_per_second'))
+                      assert math.isclose(row['items_per_second'], 512e9 / row['real_time'], rel_tol=1e-10)
           PY
       - name: Separate fixed-iteration one-worker profiles
         if: inputs.framework_profile

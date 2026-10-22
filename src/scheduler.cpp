@@ -184,7 +184,7 @@ void Scheduler::enqueue(Task&& task) {
       }
       auto affinity =
           std::make_shared<AffinityTask>(std::move(task), preferredWorker);
-      workerThreads[preferredWorker]->enqueueAffinity(affinity);
+      workerThreads[preferredWorker]->enqueueAffinity(std::move(affinity));
       for (int i = 0; i < cfg.workerThread.count; ++i) {
         if (i != preferredWorker) {
           workerThreads[i]->wakeForSteal();

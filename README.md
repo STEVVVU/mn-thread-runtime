@@ -119,6 +119,19 @@ not establish locality or production-workload performance. Both CTest suites
 passed before measurement. [All 30 samples, process CPU costs, exact command,
 source/binary identity and hashes](docs/evidence/linux-39732515159/) are retained.
 
+The [separate fixed-count one-worker profiles](docs/evidence/linux-39735074674/)
+completed 131072 callbacks per mode. Hints added exactly one shared-record
+allocation per callback and more queue/claim work: 175.42 million versus
+111.15 million full-process instructions. These instrumented counts confirm
+structural costs; they are not native timing percentages. The ownership
+protocol remains unchanged; main review approved moving an unused local shared
+pointer into its by-value argument to remove one unnecessary reference copy.
+Native validation and its timing effect remain pending. The workflow's
+`framework=true` input compares frozen `db6ecf6` and current source on one
+runner, with identical fixtures/toolchains, CTest first and five alternating
+whole passes retaining native calibration, warmup, raw JSON and resources.
+The original measurements above remain preserved; no gain is assumed.
+
 ## Upstream source and maintenance
 
 This repository retains the complete Google Marl source tree and history at base commit `b8406ab0a82524170ead6dd6c371b579bbc28b3e`. The original project README is preserved in [README.upstream.md](README.upstream.md). Keep the Apache-2.0 license and upstream notices with the source.
