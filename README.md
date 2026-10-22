@@ -59,15 +59,39 @@ build/Release/mn_thread_runtime_tests.exe --benchmark
 
 The consumer and upstream CTest suites passed on both Windows and Ubuntu in [native CI run 39716823237](https://github.com/STEVVVU/mn-thread-runtime/actions/runs/39716823237). Main also reran the maintained Windows process driver at `run-20261022-032459-699`; its evidence survived scratch cleanup.
 
-The native stencil run used 24 logical processors. Every result matched the serial checksum. The table shows the median and full range from five alternating pairs:
+The longer [native campaign](https://github.com/STEVVVU/mn-thread-runtime/actions/runs/39728441002)
+used Ubuntu 24.04, GCC 13.3 Release, and an AMD EPYC 9V45 VM reporting four
+logical CPUs on two cores. All 390 measured samples matched the serial oracle
+with zero reported errors. For 131072 cells, 256 steps, four tasks per worker
+and eight recurrence rounds, five alternating pairs gave median (full range):
 
 | Workers | Ordinary scheduling, ms | Preferred worker, ms |
 | ---: | ---: | ---: |
-| 1 | 0.7803 (0.7680–1.3655) | 0.7663 (0.7593–1.1922) |
-| 2 | 0.5289 (0.5187–0.5556) | 0.4994 (0.4871–0.9009) |
-| 4 | 0.5704 (0.4804–0.8456) | 0.4496 (0.4134–0.4740) |
+| 1 | 695.8 (692.9..702.0) | 696.5 (692.0..707.5) |
+| 2 | 350.6 (348.5..355.4) | 350.3 (348.3..351.7) |
+| 4 | 245.7 (243.8..247.1) | 243.9 (242.6..247.8) |
 
-These sub-millisecond synthetic results do not establish a latency improvement. The benchmark shows more repeated worker reuse with hints, and it records steals when another worker wins. It does not profile the limiting cost or measure cache misses, NUMA traffic, or a production workload. See the [full run notes and all samples](docs/evidence/p25-verification.md).
+The overlapping ranges show no measurable benefit from hints in this cell.
+Serial control medians were 626.3..630.2 ms. Hints were slower in the tiny-task
+control (4096 cells, zero recurrence rounds, 256 tasks per worker): with two
+workers, ordinary scheduling took 29.63 (26.07..31.75) ms versus 59.23
+(58.28..60.07) ms with hints. A separate instruction profile is pending before
+attributing that loss or changing the runtime. More observed worker reuse does
+not establish a cache or NUMA benefit. Process peak RSS across the matrix was
+4664..8544 KiB, including serial controls and scheduler creation.
+
+Reproduce the complete 39-configuration matrix after a Release build:
+
+```sh
+python3 .agents/skills/verify-mn-thread-runtime/scripts/metrics.py \
+  --exe build/mn_thread_runtime_tests --output .agents/runs/fresh-metrics
+```
+
+The [complete compact summaries and raw hashes](docs/evidence/linux-39728441002/)
+retain every measured configuration, resource scope and exact source identity.
+Kernel timers exclude scheduler creation and serial controls; the matrix covers
+synthetic working-set/granularity controls, not a production workload. Historical
+short-run evidence remains in [the first verification notes](docs/evidence/p25-verification.md).
 
 ## Upstream source and maintenance
 

@@ -15,3 +15,11 @@ scheduler creation, serial oracle and mailbox drain but include scheduling and
 step waits. The overhead control still performs stencil memory work. Placement
 and reuse counters describe observed workers, not cache/NUMA performance.
 Samples shorter than 10ms are flagged; they cannot establish a kernel speedup.
+
+The workflow's `profile_only=true` input builds/tests the real consumer and
+profiles the frozen two-worker4096-cell/256-step/256-tasks-per-worker/zero-round
+control with Callgrind under a300-second deadline. Raw instruction counts,
+annotation, source/binary identity, consumer correctness output and explicit
+exit receipt survive failure. Instrumented timing columns are diagnostic only.
+This separates allocation/queue/synchronization instruction cost from the prior
+unreported strace run; no product change follows until its limiter is inspected.

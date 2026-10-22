@@ -9,6 +9,10 @@ on:
         description: Run the frozen release scheduler matrix on Ubuntu
         type: boolean
         default: false
+      profile_only:
+        description: Profile the frozen tiny-task control without a timing campaign
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -39,7 +43,7 @@ jobs:
         run: ctest --test-dir build -C Release --output-on-failure --timeout 120
 
   metrics:
-    if: inputs.metrics
+    if: inputs.metrics || inputs.profile_only
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -48,12 +52,27 @@ jobs:
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMARL_BUILD_EXAMPLES=ON -DMARL_BUILD_TESTS=ON
       - run: cmake --build build --parallel 2 --target mn_thread_runtime_tests marl-unittests
       - run: ctest --test-dir build --output-on-failure --timeout 120
-      - run: python3 .agents/skills/verify-mn-thread-runtime/scripts/metrics.py --exe build/mn_thread_runtime_tests --output .agents/runs/metrics-${{ github.run_id }}
+      - if: ${{ !inputs.profile_only }}
+        run: python3 .agents/skills/verify-mn-thread-runtime/scripts/metrics.py --exe build/mn_thread_runtime_tests --output .agents/runs/metrics-${{ github.run_id }}
       - name: Separate synchronization profile
         run: |
+          mkdir -p .agents/runs/metrics-${{ github.run_id }}
           sudo apt-get update
           sudo apt-get install --yes strace
           timeout 240 strace -f -c build/mn_thread_runtime_tests --benchmark-metrics 2 131072 256 16 8 > .agents/runs/metrics-${{ github.run_id }}/profile.csv 2> .agents/runs/metrics-${{ github.run_id }}/profile.log
+      - name: Separate tiny-task instruction profile
+        shell: bash
+        run: |
+          evidence=".agents/runs/metrics-${{ github.run_id }}"
+          sudo apt-get install --yes valgrind
+          { git rev-parse HEAD; lscpu; c++ --version; valgrind --version; sha256sum build/mn_thread_runtime_tests; } > "$evidence/callgrind-environment.txt"
+          set +e
+          timeout 300 valgrind --tool=callgrind --callgrind-out-file="$evidence/callgrind.out" --log-file="$evidence/callgrind.log" build/mn_thread_runtime_tests --benchmark-metrics 2 4096 256 256 0 > "$evidence/callgrind-consumer.csv" 2> "$evidence/callgrind-consumer.stderr"
+          status=$?
+          set -e
+          python3 -c 'import json,sys; json.dump(dict(passed=int(sys.argv[1])==0,exit_code=int(sys.argv[1]),purpose="separate diagnostic; instrumented timings excluded",command="timeout 300 valgrind --tool=callgrind build/mn_thread_runtime_tests --benchmark-metrics 2 4096 256 256 0"),open(sys.argv[2],"w"),indent=2)' "$status" "$evidence/callgrind-result.json"
+          test "$status" -eq 0
+          callgrind_annotate --inclusive=yes --auto=yes "$evidence/callgrind.out" > "$evidence/callgrind-annotation.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
