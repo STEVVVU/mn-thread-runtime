@@ -126,11 +126,37 @@ allocation per callback and more queue/claim work: 175.42 million versus
 structural costs; they are not native timing percentages. The ownership
 protocol remains unchanged; main review approved moving an unused local shared
 pointer into its by-value argument to remove one unnecessary reference copy.
-Native validation and its timing effect remain pending. The workflow's
+Native validation passed. The workflow's
 `framework=true` input compares frozen `db6ecf6` and current source on one
 runner, with identical fixtures/toolchains, CTest first and five alternating
 whole passes retaining native calibration, warmup, raw JSON and resources.
-The original measurements above remain preserved; no gain is assumed.
+The original measurements above remain preserved.
+
+The [matched run 39739013902](https://github.com/STEVVVU/mn-thread-runtime/actions/runs/39739013902)
+compared `db6ecf6` with `51fa675` on Ubuntu 24.04/GCC 13.3 Release, an AMD
+EPYC 9V74 VM reporting four logical CPUs on two cores. Both sources passed
+consumer/upstream CTest before measurement; Windows and Ubuntu jobs passed too.
+All 300 calibrated raw iteration samples are retained. Median (full range of
+25 samples per case), in µs per 512 joined callbacks:
+
+| Workers | Scheduling | Frozen | Pointer move |
+| ---: | --- | ---: | ---: |
+| 1 | Ordinary | 150.9 (134.5..168.4) | 152.1 (133.1..172.7) |
+| 1 | Hinted | 378.2 (342.1..405.1) | 380.2 (346.4..420.5) |
+| 2 | Ordinary | 154.9 (150.2..176.0) | 153.9 (149.5..177.9) |
+| 2 | Hinted | 374.6 (364.8..400.4) | 373.7 (356.1..425.8) |
+| 4 | Ordinary | 166.1 (160.9..172.9) | 165.2 (158.5..171.3) |
+| 4 | Hinted | 421.4 (414.4..429.2) | 426.4 (410.9..443.8) |
+
+No native speedup is established: all six ranges overlap, ordinary controls
+move too, and every five-pair control-normalized hinted range crosses no change.
+The source removes one reference copy while preserving both queue references
+and exact-once claims; this run cannot attribute a timing gain to it. The shared
+allocation and duplicate-queue costs remain. Full-process peak RSS was
+4936..5164 KiB baseline and 4932..5164 KiB candidate.
+[Every sample, native pass median, control pair, CPU/resource cost, command,
+receipt and raw hash](docs/evidence/linux-39739013902/) is retained. No cache,
+NUMA or production-workload benefit follows from these empty callbacks.
 
 ## Upstream source and maintenance
 

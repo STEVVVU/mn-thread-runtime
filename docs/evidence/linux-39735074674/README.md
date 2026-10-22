@@ -55,7 +55,8 @@ its local shared pointer by lvalue into a by-value enqueueAffinity argument,
 temporarily retaining a third reference beyond the two required queue refs.
 Moving that local argument could eliminate its increment/release without
 changing the queue protocol. Main source review approved that one-line move;
-native validation and a same-runner comparison against db6ecf6 remain pending.
+native validation and the [same-runner comparison](../linux-39739013902/) passed,
+but no native timing improvement was established.
 The allocation, duplicate queues and exact-once claim cannot simply be removed
 without a separately reviewed ownership redesign. Existing Pool reuse was
 examined: pool.h depends on conditionvariable.h and scheduler.h, so direct

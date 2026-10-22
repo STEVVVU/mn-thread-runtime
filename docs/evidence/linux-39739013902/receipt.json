@@ -1,0 +1,12 @@
+{
+  "passed": true,
+  "exit_code": 0,
+  "cleanup_complete": true,
+  "baseline_source": "db6ecf6d62de6a20533077ce5c5c352d8b2fd42b",
+  "candidate_source": "51fa67547fd59018726a3e9398db2495623356a2",
+  "passes_per_source": 5,
+  "native_repeats_per_case": 5,
+  "callbacks_per_batch": 512,
+  "calibration_seconds": 0.5,
+  "warmup_seconds": 0.1
+}
