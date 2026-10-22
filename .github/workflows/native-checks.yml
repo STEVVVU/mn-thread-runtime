@@ -3,6 +3,12 @@ name: Native checks
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      metrics:
+        description: Run the frozen release scheduler matrix on Ubuntu
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -31,3 +37,26 @@ jobs:
 
       - name: Run consumer and upstream tests
         run: ctest --test-dir build -C Release --output-on-failure --timeout 120
+
+  metrics:
+    if: inputs.metrics
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: git submodule update --init third_party/googletest
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMARL_BUILD_EXAMPLES=ON -DMARL_BUILD_TESTS=ON
+      - run: cmake --build build --parallel 2 --target mn_thread_runtime_tests marl-unittests
+      - run: ctest --test-dir build --output-on-failure --timeout 120
+      - run: python3 .agents/skills/verify-mn-thread-runtime/scripts/metrics.py --exe build/mn_thread_runtime_tests --output .agents/runs/metrics-${{ github.run_id }}
+      - name: Separate synchronization profile
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes strace
+          timeout 240 strace -f -c build/mn_thread_runtime_tests --benchmark-metrics 2 131072 256 16 8 > .agents/runs/metrics-${{ github.run_id }}/profile.csv 2> .agents/runs/metrics-${{ github.run_id }}/profile.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: scheduler-metrics-${{ github.run_id }}
+          path: .agents/runs/metrics-${{ github.run_id }}/
+          include-hidden-files: true

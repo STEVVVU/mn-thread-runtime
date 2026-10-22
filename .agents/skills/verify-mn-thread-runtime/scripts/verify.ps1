@@ -1,5 +1,6 @@
 param(
-  [switch]$Doctor
+  [switch]$Doctor,
+  [switch]$Metrics
 )
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '../../../..')).Path
@@ -71,6 +72,10 @@ try {
   $testRun = InvokeOwnedProcess $ctest "--test-dir `"$build`" -C Release --output-on-failure"
   Add-Content -LiteralPath $transcript -Value "CTest exit code: $($testRun.ExitCode)`n$($testRun.Output)" -Encoding utf8
   if ($testRun.ExitCode -ne 0) { throw "CTest failed with exit code $($testRun.ExitCode). Evidence: $transcript" }
+  if ($Metrics) {
+    & python (Join-Path $PSScriptRoot 'metrics.py') --exe $exe --output (Join-Path $evidenceDir 'metrics')
+    if ($LASTEXITCODE -ne 0) { throw "Benchmark failed. Evidence: $evidenceDir" }
+  }
   Write-Output "Run: $runId"
   Write-Output "Evidence: $transcript"
   Remove-Item -LiteralPath $tempDir -Force -Recurse

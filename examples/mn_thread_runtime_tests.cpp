@@ -316,24 +316,26 @@ void testShutdownDrain() {
 
 struct RunResult {
   double milliseconds = 0.0;
+  double serialMilliseconds = 0.0;
   double checksum = 0.0;
   uint64_t workerReuses = 0;
   uint64_t preferredMatches = 0;
   marl::Scheduler::AffinityStats affinity;
 };
 
-RunResult runStencil(int workers, bool locality) {
-  const int cells = 8192;
-  const int iterations = 32;
+RunResult runStencil(int workers, bool locality, int cells = 8192,
+                     int iterations = 32, int partitions = 0, int rounds = 1) {
+  if (!partitions) partitions = workers;
   std::vector<double> current(cells), next(cells);
   for (int i = 0; i < cells; ++i) {
     current[i] = std::sin(i * 0.017) + (i % 17) * 0.001;
   }
   auto serial = current;
+  const auto serialBegin = std::chrono::steady_clock::now();
   for (int step = 0; step < iterations; ++step) {
     for (int i = 1; i < cells - 1; ++i) {
       next[i] = (serial[i - 1] + 2.0 * serial[i] + serial[i + 1]) * 0.25;
-      const int turns = 1 + ((i * 13 + step * 7) % 7);
+      const int turns = rounds * (1 + ((i * 13 + step * 7) % 7));
       double value = next[i];
       for (int j = 0; j < turns; ++j) {
         value = value * 0.999999 + 0.000001 * serial[i];
@@ -344,35 +346,37 @@ RunResult runStencil(int workers, bool locality) {
     next.back() = serial.back();
     serial.swap(next);
   }
+  const auto serialEnd = std::chrono::steady_clock::now();
 
   marl::Scheduler scheduler(configFor(workers));
   scheduler.bind();
   const auto begin = std::chrono::steady_clock::now();
-  std::vector<int> lastWorker(workers, -1);
+  std::vector<int> lastWorker(partitions, -1);
   std::atomic<uint64_t> workerReuses{0};
   std::atomic<uint64_t> preferredMatches{0};
   for (int step = 0; step < iterations; ++step) {
-    marl::WaitGroup done(workers);
-    for (int part = 0; part < workers; ++part) {
+    marl::WaitGroup done(partitions);
+    for (int part = 0; part < partitions; ++part) {
       auto run = [&, part, step, done] {
         defer(done.done());
         if (workerId == lastWorker[part]) {
           workerReuses.fetch_add(1);
         }
-        if (locality && workerId == part) {
+        if (locality && workerId == part % workers) {
           preferredMatches.fetch_add(1);
         }
         lastWorker[part] = workerId;
-        const int begin = part * cells / workers;
-        const int end = (part + 1) * cells / workers;
+        const int begin = part * cells / partitions;
+        const int end = (part + 1) * cells / partitions;
         for (int i = begin; i < end; ++i) {
           if (i == 0 || i == cells - 1) {
             next[i] = current[i];
+            continue;
           } else {
             next[i] =
                 (current[i - 1] + 2.0 * current[i] + current[i + 1]) * 0.25;
           }
-          const int turns = 1 + ((i * 13 + step * 7) % 7);
+          const int turns = rounds * (1 + ((i * 13 + step * 7) % 7));
           double value = next[i];
           for (int j = 0; j < turns; ++j) {
             value = value * 0.999999 + 0.000001 * current[i];
@@ -382,7 +386,7 @@ RunResult runStencil(int workers, bool locality) {
       };
       if (locality) {
         marl::Task task(run);
-        task.setPreferredWorker(part);
+        task.setPreferredWorker(part % workers);
         marl::schedule(std::move(task));
       } else {
         marl::schedule(run);
@@ -395,12 +399,14 @@ RunResult runStencil(int workers, bool locality) {
   RunResult result;
   result.milliseconds =
       std::chrono::duration<double, std::milli>(end - begin).count();
+  result.serialMilliseconds =
+      std::chrono::duration<double, std::milli>(serialEnd - serialBegin).count();
   result.checksum = std::accumulate(current.begin(), current.end(), 0.0);
   result.affinity = scheduler.affinityStats();
   result.workerReuses = workerReuses.load();
   result.preferredMatches = preferredMatches.load();
   if (locality) {
-    const uint64_t expected = static_cast<uint64_t>(workers * iterations);
+    const uint64_t expected = static_cast<uint64_t>(partitions * iterations);
     const auto drainDeadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (scheduler.affinityStats().duplicateSkips < expected &&
@@ -425,25 +431,30 @@ RunResult runStencil(int workers, bool locality) {
   return result;
 }
 
-void runBenchmark() {
+void runBenchmark(int selectedWorkers = 0, int cells = 8192, int steps = 32,
+                  int tasksPerWorker = 1, int rounds = 1) {
   for (int workers : {1, 2, 4}) {
-    (void)runStencil(workers, false);  // warmup
-    (void)runStencil(workers, true);   // warmup
+    if (selectedWorkers && selectedWorkers != workers) continue;
+    const int partitions = workers * tasksPerWorker;
+    (void)runStencil(workers, false, cells, steps, partitions, rounds);
+    (void)runStencil(workers, true, cells, steps, partitions, rounds);
     std::cout
         << "workers,mode,sample,ms,checksum,worker_reuses,preferred_matches,"
-           "preferred,stolen,duplicate_skips"
+           "preferred,stolen,duplicate_skips,serial_ms,cells,steps,tasks,rounds,errors"
         << std::endl;
     for (int sample = 0; sample < 5; ++sample) {
       const bool firstMode = sample % 2 == 0;
       for (bool locality : {firstMode, !firstMode}) {
-        const auto result = runStencil(workers, locality);
+        const auto result = runStencil(workers, locality, cells, steps, partitions, rounds);
         std::cout << workers << ',' << (locality ? "locality" : "baseline")
                   << ',' << sample << ',' << result.milliseconds << ','
                   << result.checksum << ',' << result.workerReuses << ','
                   << result.preferredMatches << ','
                   << result.affinity.preferredExecutions << ','
                   << result.affinity.stolenExecutions << ','
-                  << result.affinity.duplicateSkips << std::endl;
+                  << result.affinity.duplicateSkips << ','
+                  << result.serialMilliseconds << ',' << cells << ',' << steps
+                  << ',' << partitions * steps << ',' << rounds << ",0" << std::endl;
       }
     }
   }
@@ -452,6 +463,20 @@ void runBenchmark() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 7 && std::string(argv[1]) == "--benchmark-metrics") {
+    const int workers = std::stoi(argv[2]);
+    const int cells = std::stoi(argv[3]);
+    const int steps = std::stoi(argv[4]);
+    const int tasksPerWorker = std::stoi(argv[5]);
+    const int rounds = std::stoi(argv[6]);
+    require((workers == 1 || workers == 2 || workers == 4) &&
+                cells >= 3 && cells <= 1048576 && steps >= 1 && steps <= 4096 &&
+                tasksPerWorker >= 1 && tasksPerWorker <= 256 &&
+                rounds >= 0 && rounds <= 64,
+            "benchmark configuration is bounded");
+    runBenchmark(workers, cells, steps, tasksPerWorker, rounds);
+    return 0;
+  }
   if (argc > 1 && std::string(argv[1]) == "--benchmark") {
     runBenchmark();
     return 0;
