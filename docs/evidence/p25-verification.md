@@ -37,3 +37,7 @@ The run used 24 logical processors and observed 9% total CPU use before measurem
 All 30 checksums were `93.7686` at the printed precision, and the consumer checked each result against the serial oracle with a `1e-8` tolerance. The output records per-partition worker reuse, tasks that ran on their preferred worker, steals, and duplicate skips in [p25-stencil.csv](p25-stencil.csv).
 
 These sub-millisecond synthetic timings do not show whether locality scheduling improves an application. The runs show that the hint increases same-worker reuse and that stealing still occurs. I did not profile the runtime to identify the timing limit, and no cache-miss, NUMA, or speedup claim follows from this run.
+# Hosted verification
+
+At source head `53aadbd6b185ee6765b7048a9388c6afa3bd1380`, [run 39716823237](https://github.com/STEVVVU/mn-thread-runtime/actions/runs/39716823237) passed both `CMake / windows-latest` and `CMake / ubuntu-latest`. Both jobs initialized the existing pinned GoogleTest gitlink, built the real consumer and upstream tests, and reported two of two CTest entries passed. These checks establish runtime correctness for the covered cases, without a performance conclusion.
+

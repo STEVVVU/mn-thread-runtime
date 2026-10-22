@@ -57,6 +57,8 @@ build/Release/mn_thread_runtime_tests.exe --benchmark
 
 ## Measured evidence
 
+The consumer and upstream CTest suites passed on both Windows and Ubuntu in [native CI run 39716823237](https://github.com/STEVVVU/mn-thread-runtime/actions/runs/39716823237). Main also reran the maintained Windows process driver at `run-20261022-032459-699`; its evidence survived scratch cleanup.
+
 The native stencil run used 24 logical processors. Every result matched the serial checksum. The table shows the median and full range from five alternating pairs:
 
 | Workers | Ordinary scheduling, ms | Preferred worker, ms |
