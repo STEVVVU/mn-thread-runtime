@@ -18,6 +18,38 @@
 
 #include "benchmark/benchmark.h"
 
+#include <utility>
+
+BENCHMARK_DEFINE_F(Schedule, HintedForkJoin)(benchmark::State& state) {
+  run(state, [&](int numTasks) {
+    for (auto _ : state) {
+      marl::WaitGroup done(numTasks);
+      for (int i = 0; i < numTasks; ++i) {
+        marl::Task task([done] { done.done(); });
+        if (state.range(2)) {
+          task.setPreferredWorker(i % numThreads(state));
+        }
+        marl::schedule(std::move(task));
+      }
+      done.wait();
+    }
+  });
+  state.SetItemsProcessed(state.iterations() * numTasks(state));
+}
+BENCHMARK_REGISTER_F(Schedule, HintedForkJoin)
+    ->Apply([](benchmark::internal::Benchmark* b) {
+      b->ArgNames({"tasks", "threads", "hinted"});
+      for (int workers : {1, 2, 4}) {
+        if (workers <= static_cast<int>(marl::Thread::numLogicalCPUs())) {
+          for (int hinted : {0, 1}) {
+            b->Args({512, workers, hinted});
+          }
+        }
+      }
+    })
+    ->MeasureProcessCPUTime()
+    ->UseRealTime();
+
 BENCHMARK_DEFINE_F(Schedule, Empty)(benchmark::State& state) {
   run(state, [&](int numTasks) {
     for (auto _ : state) {

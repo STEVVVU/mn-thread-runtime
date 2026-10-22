@@ -23,3 +23,17 @@ annotation, source/binary identity, consumer correctness output and explicit
 exit receipt survive failure. Instrumented timing columns are diagnostic only.
 This separates allocation/queue/synchronization instruction cost from the prior
 unreported strace run; no product change follows until its limiter is inspected.
+
+For calibrated scheduler overhead, use the existing pinned Google Benchmark
+target with the workflow input `framework=true`. `Schedule/HintedForkJoin`
+compares 512 completed callbacks per fork/join with ordinary or preferred
+placement at 1/2/4 available logical workers. The existing real consumer and
+upstream suite run first. Google Benchmark controls duration, warmup, five
+randomly interleaved repetitions, process CPU/wall time, throughput and native
+JSON; no custom timing/report engine is added. Scheduler creation and final
+losing-reference drain are outside the calibrated loop. Full task/fiber and
+reclamation correctness remains the maintained consumer's oracle.
+
+The pinned implementation already supports these flags and APIs. See its
+[command flags](https://github.com/google/benchmark/blob/2dd015dfef425c866d9a43f2c67d8b52d709acb6/src/benchmark.cc)
+and [timing APIs](https://github.com/google/benchmark/blob/2dd015dfef425c866d9a43f2c67d8b52d709acb6/include/benchmark/benchmark.h).

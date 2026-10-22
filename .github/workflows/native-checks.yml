@@ -13,6 +13,10 @@ on:
         description: Profile the frozen tiny-task control without a timing campaign
         type: boolean
         default: false
+      framework:
+        description: Run the pinned Google Benchmark hinted fork/join cases
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -43,24 +47,46 @@ jobs:
         run: ctest --test-dir build -C Release --output-on-failure --timeout 120
 
   metrics:
-    if: inputs.metrics || inputs.profile_only
+    if: inputs.metrics || inputs.profile_only || inputs.framework
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - run: git submodule update --init third_party/googletest
-      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMARL_BUILD_EXAMPLES=ON -DMARL_BUILD_TESTS=ON
+      - if: inputs.framework
+        run: git submodule update --init third_party/benchmark
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMARL_BUILD_EXAMPLES=ON -DMARL_BUILD_TESTS=ON -DMARL_BUILD_BENCHMARKS=${{ inputs.framework && 'ON' || 'OFF' }}
       - run: cmake --build build --parallel 2 --target mn_thread_runtime_tests marl-unittests
       - run: ctest --test-dir build --output-on-failure --timeout 120
-      - if: ${{ !inputs.profile_only }}
+      - if: ${{ !inputs.profile_only && !inputs.framework }}
         run: python3 .agents/skills/verify-mn-thread-runtime/scripts/metrics.py --exe build/mn_thread_runtime_tests --output .agents/runs/metrics-${{ github.run_id }}
+      - name: Pinned Google Benchmark scheduling comparison
+        if: inputs.framework
+        shell: bash
+        run: |
+          evidence=".agents/runs/metrics-${{ github.run_id }}"
+          mkdir -p "$evidence"
+          cmake --build build --parallel 2 --target marl-benchmarks
+          { git rev-parse HEAD; git submodule status third_party/benchmark; lscpu; c++ --version; sha256sum build/marl-benchmarks; } > "$evidence/framework-environment.txt"
+          timeout 180 build/marl-benchmarks --benchmark_filter='^Schedule/HintedForkJoin/' --benchmark_min_time=0.5s --benchmark_min_warmup_time=0.1 --benchmark_repetitions=5 --benchmark_enable_random_interleaving=true --benchmark_out="$evidence/google-benchmark.json" --benchmark_out_format=json > "$evidence/google-benchmark.log" 2>&1
+          python3 - "$evidence/google-benchmark.json" <<'PY'
+          import collections, json, os, sys
+          data = json.load(open(sys.argv[1]))
+          rows = [row for row in data['benchmarks'] if row['run_type'] == 'iteration']
+          expected = 2 * sum(n <= os.cpu_count() for n in (1, 2, 4))
+          counts = collections.Counter(row['run_name'] for row in rows)
+          assert len(counts) == expected and all(n == 5 for n in counts.values())
+          assert all(not row.get('error_occurred') and row['real_time'] > 0 and row['items_per_second'] > 0 for row in rows)
+          PY
       - name: Separate synchronization profile
+        if: ${{ !inputs.framework }}
         run: |
           mkdir -p .agents/runs/metrics-${{ github.run_id }}
           sudo apt-get update
           sudo apt-get install --yes strace
           timeout 240 strace -f -c build/mn_thread_runtime_tests --benchmark-metrics 2 131072 256 16 8 > .agents/runs/metrics-${{ github.run_id }}/profile.csv 2> .agents/runs/metrics-${{ github.run_id }}/profile.log
       - name: Separate tiny-task instruction profile
+        if: ${{ !inputs.framework }}
         shell: bash
         run: |
           evidence=".agents/runs/metrics-${{ github.run_id }}"
