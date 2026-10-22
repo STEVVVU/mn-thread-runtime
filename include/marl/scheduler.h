@@ -31,6 +31,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <memory>
 #include <thread>
 
 namespace marl {
@@ -47,6 +48,12 @@ class Scheduler {
   class Worker;
 
  public:
+  struct AffinityStats {
+    uint64_t preferredExecutions = 0;
+    uint64_t stolenExecutions = 0;
+    uint64_t duplicateSkips = 0;
+  };
+
   using TimePoint = std::chrono::system_clock::time_point;
   using Predicate = std::function<bool()>;
   using ThreadInitializer = std::function<void(int workerId)>;
@@ -121,6 +128,11 @@ class Scheduler {
   // enqueue() queues the task for asynchronous execution.
   MARL_EXPORT
   void enqueue(Task&& task);
+
+  // affinityStats() returns cumulative counts for hinted tasks in this
+  // scheduler.
+  MARL_EXPORT
+  AffinityStats affinityStats() const;
 
   // config() returns the Config that was used to build the scheduler.
   MARL_EXPORT
@@ -319,7 +331,23 @@ class Scheduler {
 
   // TODO: Implement a queue that recycles elements to reduce number of
   // heap allocations.
-  using TaskQueue = containers::deque<Task>;
+  struct AffinityTask {
+    AffinityTask(Task&& task, int workerId)
+        : task(std::move(task)), workerId(workerId) {}
+    Task task;
+    int const workerId;
+    std::atomic<bool> claimed{false};
+  };
+  struct QueuedTask {
+    QueuedTask() = default;
+    explicit QueuedTask(Task&& task) : task(std::move(task)) {}
+    explicit QueuedTask(std::shared_ptr<AffinityTask>&& task)
+        : affinity(std::move(task)) {}
+    Task task;
+    std::shared_ptr<AffinityTask> affinity;
+  };
+  using TaskQueue = containers::deque<QueuedTask>;
+  using AffinityQueue = containers::deque<std::shared_ptr<AffinityTask>>;
   using FiberQueue = containers::deque<Fiber*>;
   using FiberSet = containers::unordered_set<Fiber*>;
 
@@ -379,13 +407,22 @@ class Scheduler {
     // _Releases_lock_(work.mutex)
     void enqueueAndUnlock(Task&& task) REQUIRES(work.mutex) RELEASE(work.mutex);
 
+    void enqueueAffinity(std::shared_ptr<AffinityTask> task)
+        EXCLUDES(work.mutex);
+
+    // execute() claims duplicated affinity work before invoking it.
+    bool execute(QueuedTask& task);
+
     // runUntilShutdown() processes all tasks and fibers until there are no more
     // and shutdown is true, upon runUntilShutdown() returns.
     void runUntilShutdown() REQUIRES(work.mutex);
 
     // steal() attempts to steal a Task from the worker for another worker.
     // Returns true if a task was taken and assigned to out, otherwise false.
-    bool steal(Task& out) EXCLUDES(work.mutex);
+    bool steal(QueuedTask& out) EXCLUDES(work.mutex);
+
+    // wakeForSteal() wakes an idle worker to look for queued work elsewhere.
+    void wakeForSteal() EXCLUDES(work.mutex);
 
     // getCurrent() returns the Worker currently bound to the current
     // thread.
@@ -441,9 +478,11 @@ class Scheduler {
       std::atomic<uint64_t> num = {0};  // tasks.size() + fibers.size()
       GUARDED_BY(mutex) uint64_t numBlockedFibers = 0;
       GUARDED_BY(mutex) TaskQueue tasks;
+      GUARDED_BY(mutex) AffinityQueue affinity;
       GUARDED_BY(mutex) FiberQueue fibers;
       GUARDED_BY(mutex) WaitingFibers waiting;
       GUARDED_BY(mutex) bool notifyAdded = true;
+      GUARDED_BY(mutex) bool stealSignal = false;
       std::condition_variable added;
       marl::mutex mutex;
 
@@ -483,7 +522,7 @@ class Scheduler {
 
   // stealWork() attempts to steal a task from the worker with the given id.
   // Returns true if a task was stolen and assigned to out, otherwise false.
-  bool stealWork(Worker* thief, uint64_t from, Task& out);
+  bool stealWork(Worker* thief, uint64_t from, QueuedTask& out);
 
   // onBeginSpinning() is called when a Worker calls spinForWork().
   // The scheduler will prioritize this worker for new tasks to try to prevent
@@ -504,6 +543,9 @@ class Scheduler {
 
   std::atomic<unsigned int> nextEnqueueIndex = {0};
   std::array<Worker*, MaxWorkerThreads> workerThreads;
+  std::atomic<uint64_t> preferredExecutions{0};
+  std::atomic<uint64_t> stolenExecutions{0};
+  std::atomic<uint64_t> duplicateSkips{0};
 
   struct SingleThreadedWorkers {
     inline SingleThreadedWorkers(Allocator*);

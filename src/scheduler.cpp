@@ -169,11 +169,29 @@ Scheduler::~Scheduler() {
 }
 
 void Scheduler::enqueue(Task&& task) {
+  MARL_ASSERT(task.preferredWorker() >= -1,
+              "preferred worker id must be -1 or a valid worker index");
   if (task.is(Task::Flags::SameThread)) {
     Worker::getCurrent()->enqueue(std::move(task));
     return;
   }
   if (cfg.workerThread.count > 0) {
+    const int preferredWorker = task.preferredWorker();
+    if (preferredWorker >= 0) {
+      if (preferredWorker >= cfg.workerThread.count) {
+        fatal("preferred worker %d is outside worker count %d\n",
+              preferredWorker, cfg.workerThread.count);
+      }
+      auto affinity =
+          std::make_shared<AffinityTask>(std::move(task), preferredWorker);
+      workerThreads[preferredWorker]->enqueueAffinity(affinity);
+      for (int i = 0; i < cfg.workerThread.count; ++i) {
+        if (i != preferredWorker) {
+          workerThreads[i]->wakeForSteal();
+        }
+      }
+      return;
+    }
     while (true) {
       // Prioritize workers that have recently started spinning.
       auto i = --nextSpinningWorkerIdx % cfg.workerThread.count;
@@ -201,11 +219,19 @@ void Scheduler::enqueue(Task&& task) {
   }
 }
 
+Scheduler::AffinityStats Scheduler::affinityStats() const {
+  AffinityStats stats;
+  stats.preferredExecutions = preferredExecutions.load();
+  stats.stolenExecutions = stolenExecutions.load();
+  stats.duplicateSkips = duplicateSkips.load();
+  return stats;
+}
+
 const Scheduler::Config& Scheduler::config() const {
   return cfg;
 }
 
-bool Scheduler::stealWork(Worker* thief, uint64_t from, Task& out) {
+bool Scheduler::stealWork(Worker* thief, uint64_t from, QueuedTask& out) {
   if (cfg.workerThread.count > 0) {
     auto thread = workerThreads[from % cfg.workerThread.count];
     if (thread != thief) {
@@ -548,7 +574,7 @@ void Scheduler::Worker::enqueue(Task&& task) {
 
 void Scheduler::Worker::enqueueAndUnlock(Task&& task) {
   auto notify = work.notifyAdded;
-  work.tasks.push_back(std::move(task));
+  work.tasks.emplace_back(std::move(task));
   work.num++;
   work.mutex.unlock();
   if (notify) {
@@ -556,14 +582,56 @@ void Scheduler::Worker::enqueueAndUnlock(Task&& task) {
   }
 }
 
-bool Scheduler::Worker::steal(Task& out) {
+void Scheduler::Worker::enqueueAffinity(std::shared_ptr<AffinityTask> task) {
+  work.mutex.lock();
+  auto notify = work.notifyAdded;
+  work.affinity.push_back(task);
+  work.tasks.emplace_back(std::move(task));
+  work.num += 2;
+  work.mutex.unlock();
+  if (notify) {
+    work.added.notify_one();
+  }
+}
+
+void Scheduler::Worker::wakeForSteal() {
+  {
+    marl::lock lock(work.mutex);
+    work.stealSignal = true;
+  }
+  work.added.notify_one();
+}
+
+bool Scheduler::Worker::execute(QueuedTask& queued) {
+  if (!queued.affinity) {
+    queued.task();
+    return true;
+  }
+  bool expected = false;
+  if (!queued.affinity->claimed.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    scheduler->duplicateSkips.fetch_add(1);
+    return false;
+  }
+  if (id == static_cast<uint32_t>(queued.affinity->workerId)) {
+    scheduler->preferredExecutions.fetch_add(1);
+  } else {
+    scheduler->stolenExecutions.fetch_add(1);
+  }
+  queued.affinity->task();
+  return true;
+}
+
+bool Scheduler::Worker::steal(QueuedTask& out) {
   if (work.num.load() == 0) {
     return false;
   }
   if (!work.mutex.try_lock()) {
     return false;
   }
-  if (work.tasks.empty() || work.tasks.front().is(Task::Flags::SameThread)) {
+  if (work.tasks.empty() ||
+      (!work.tasks.front().affinity &&
+       work.tasks.front().task.is(Task::Flags::SameThread))) {
     work.mutex.unlock();
     return false;
   }
@@ -580,7 +648,7 @@ void Scheduler::Worker::run() {
     // Start with a regular condition-variable wait for work. This avoids
     // starting the thread with a spinForWorkAndLock().
     work.wait([this]() REQUIRES(work.mutex) {
-      return work.num > 0 || work.waiting || shutdown;
+      return work.num > 0 || work.waiting || work.stealSignal || shutdown;
     });
   }
   ASSERT_FIBER_STATE(currentFiber, Fiber::State::Running);
@@ -596,20 +664,23 @@ void Scheduler::Worker::runUntilShutdown() {
 }
 
 void Scheduler::Worker::waitForWork() {
-  MARL_ASSERT(work.num == work.fibers.size() + work.tasks.size(),
-              "work.num out of sync");
+  MARL_ASSERT(
+      work.num == work.fibers.size() + work.tasks.size() + work.affinity.size(),
+      "work.num out of sync");
   if (work.num > 0) {
     return;
   }
 
   if (mode == Mode::MultiThreaded) {
     scheduler->onBeginSpinning(id);
+    work.stealSignal = false;
     work.mutex.unlock();
     spinForWorkAndLock();
   }
 
   work.wait([this]() REQUIRES(work.mutex) {
-    return work.num > 0 || (shutdown && work.numBlockedFibers == 0U);
+    return work.num > 0 || work.stealSignal ||
+           (shutdown && work.numBlockedFibers == 0U);
   });
   if (work.waiting) {
     enqueueFiberTimeouts();
@@ -644,7 +715,7 @@ void Scheduler::Worker::setFiberState(Fiber* fiber, Fiber::State to) const {
 
 void Scheduler::Worker::spinForWorkAndLock() {
   TRACE("SPIN");
-  Task stolen;
+  QueuedTask stolen;
 
   constexpr auto duration = std::chrono::milliseconds(1);
   auto start = std::chrono::high_resolution_clock::now();
@@ -662,8 +733,7 @@ void Scheduler::Worker::spinForWorkAndLock() {
         work.mutex.lock();
         if (work.num > 0) {
           return;
-        }
-        else {
+        } else {
           // Our new task was stolen by another worker. Keep spinning.
           work.mutex.unlock();
         }
@@ -684,9 +754,11 @@ void Scheduler::Worker::spinForWorkAndLock() {
 
 void Scheduler::Worker::runUntilIdle() {
   ASSERT_FIBER_STATE(currentFiber, Fiber::State::Running);
-  MARL_ASSERT(work.num == work.fibers.size() + work.tasks.size(),
-              "work.num out of sync");
-  while (!work.fibers.empty() || !work.tasks.empty()) {
+  MARL_ASSERT(
+      work.num == work.fibers.size() + work.tasks.size() + work.affinity.size(),
+      "work.num out of sync");
+  while (!work.fibers.empty() || !work.affinity.empty() ||
+         !work.tasks.empty()) {
     // Note: we cannot take and store on the stack more than a single fiber
     // or task at a time, as the Fiber may yield and these items may get
     // held on suspended fiber stack.
@@ -708,17 +780,27 @@ void Scheduler::Worker::runUntilIdle() {
       changeFiberState(currentFiber, Fiber::State::Idle, Fiber::State::Running);
     }
 
+    if (!work.affinity.empty()) {
+      work.num--;
+      auto affinity = containers::take(work.affinity);
+      QueuedTask task(std::move(affinity));
+      work.mutex.unlock();
+      execute(task);
+      task = QueuedTask();
+      work.mutex.lock();
+    }
+
     if (!work.tasks.empty()) {
       work.num--;
       auto task = containers::take(work.tasks);
       work.mutex.unlock();
 
       // Run the task.
-      task();
+      execute(task);
 
       // std::function<> can carry arguments with complex destructors.
       // Ensure these are destructed outside of the lock.
-      task = Task();
+      task = QueuedTask();
 
       work.mutex.lock();
     }
@@ -749,7 +831,10 @@ void Scheduler::Worker::switchToFiber(Fiber* to) {
 // Scheduler::Worker::Work
 ////////////////////////////////////////////////////////////////////////////////
 Scheduler::Worker::Work::Work(Allocator* allocator)
-    : tasks(allocator), fibers(allocator), waiting(allocator) {}
+    : tasks(allocator),
+      affinity(allocator),
+      fibers(allocator),
+      waiting(allocator) {}
 
 template <typename F>
 void Scheduler::Worker::Work::wait(F&& f) {

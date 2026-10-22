@@ -15,6 +15,7 @@
 #ifndef marl_task_h
 #define marl_task_h
 
+#include "debug.h"
 #include "export.h"
 
 #include <functional>
@@ -56,14 +57,29 @@ class Task {
   // is() returns true if the Task was created with the given flag.
   MARL_NO_EXPORT inline bool is(Flags flag) const;
 
+  // setPreferredWorker() hints which worker should run this task when possible.
+  // The task remains stealable by other workers for load balancing. Use -1 to
+  // clear the hint. A single-threaded scheduler ignores the hint.
+  MARL_NO_EXPORT inline Task& setPreferredWorker(int workerId);
+
+  // preferredWorker() returns the worker hint, or -1 when no hint is set.
+  MARL_NO_EXPORT inline int preferredWorker() const;
+
  private:
   Function function;
   Flags flags = Flags::None;
+  int preferredWorkerId = -1;
 };
 
 Task::Task() = default;
-Task::Task(const Task& o) : function(o.function), flags(o.flags) {}
-Task::Task(Task&& o) : function(std::move(o.function)), flags(o.flags) {}
+Task::Task(const Task& o)
+    : function(o.function),
+      flags(o.flags),
+      preferredWorkerId(o.preferredWorkerId) {}
+Task::Task(Task&& o)
+    : function(std::move(o.function)),
+      flags(o.flags),
+      preferredWorkerId(o.preferredWorkerId) {}
 Task::Task(const Function& function_, Flags flags_ /* = Flags::None */)
     : function(function_), flags(flags_) {}
 Task::Task(Function&& function_, Flags flags_ /* = Flags::None */)
@@ -71,22 +87,26 @@ Task::Task(Function&& function_, Flags flags_ /* = Flags::None */)
 Task& Task::operator=(const Task& o) {
   function = o.function;
   flags = o.flags;
+  preferredWorkerId = o.preferredWorkerId;
   return *this;
 }
 Task& Task::operator=(Task&& o) {
   function = std::move(o.function);
   flags = o.flags;
+  preferredWorkerId = o.preferredWorkerId;
   return *this;
 }
 
 Task& Task::operator=(const Function& f) {
   function = f;
   flags = Flags::None;
+  preferredWorkerId = -1;
   return *this;
 }
 Task& Task::operator=(Function&& f) {
   function = std::move(f);
   flags = Flags::None;
+  preferredWorkerId = -1;
   return *this;
 }
 Task::operator bool() const {
@@ -100,6 +120,18 @@ void Task::operator()() const {
 bool Task::is(Flags flag) const {
   return (static_cast<int>(flags) & static_cast<int>(flag)) ==
          static_cast<int>(flag);
+}
+
+Task& Task::setPreferredWorker(int workerId) {
+  if (workerId < -1) {
+    fatal("preferred worker id must be -1 or a valid worker index\n");
+  }
+  preferredWorkerId = workerId;
+  return *this;
+}
+
+int Task::preferredWorker() const {
+  return preferredWorkerId;
 }
 
 }  // namespace marl

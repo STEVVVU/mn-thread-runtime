@@ -1,9 +1,12 @@
 /.vs/
 /.vscode/
 /build/
+/build-baseline/
 /cmake-build-*/
+/.agents/runs/
 /out/
 bazel-*
 CMakeSettings.json
 /.idea/
 MODULE.bazel.lock
+.audit/

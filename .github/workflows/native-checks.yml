@@ -1,0 +1,33 @@
+name: Native checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cmake:
+    name: CMake / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Initialize the pinned GoogleTest submodule
+        run: git submodule update --init third_party/googletest
+
+      - name: Configure
+        run: cmake -S . -B build -DMARL_BUILD_EXAMPLES=ON -DMARL_BUILD_TESTS=ON -DMARL_BUILD_BENCHMARKS=OFF
+
+      - name: Build consumer and upstream tests
+        run: cmake --build build --config Release --parallel --target mn_thread_runtime_tests marl-unittests
+
+      - name: Run consumer and upstream tests
+        run: ctest --test-dir build -C Release --output-on-failure --timeout 120

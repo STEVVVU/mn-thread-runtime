@@ -322,6 +322,7 @@ endif(MARL_INSTALL)
 
 # tests
 if(MARL_BUILD_TESTS)
+    include(CTest)
     set(MARL_TEST_LIST
         ${MARL_SRC_DIR}/blockingcall_test.cpp
         ${MARL_SRC_DIR}/conditionvariable_test.cpp
@@ -366,6 +367,9 @@ if(MARL_BUILD_TESTS)
     marl_set_target_options(marl-unittests)
 
     target_link_libraries(marl-unittests PRIVATE marl)
+    if(BUILD_TESTING)
+        add_test(NAME marl-unittests COMMAND marl-unittests)
+    endif()
 endif(MARL_BUILD_TESTS)
 
 # benchmarks
@@ -395,6 +399,7 @@ endif(MARL_BUILD_BENCHMARKS)
 
 # examples
 if(MARL_BUILD_EXAMPLES)
+    include(CTest)
     function(build_example target)
         add_executable(${target} "${CMAKE_CURRENT_SOURCE_DIR}/examples/${target}.cpp")
         set_target_properties(${target} PROPERTIES FOLDER "Examples")
@@ -416,4 +421,9 @@ if(MARL_BUILD_EXAMPLES)
     build_example(hello_task)
     build_example(primes)
     build_example(tasks_in_tasks)
+    build_example(mn_thread_runtime_tests)
+    if(BUILD_TESTING)
+        add_test(NAME mn_thread_runtime_tests
+            COMMAND mn_thread_runtime_tests)
+    endif()
 endif(MARL_BUILD_EXAMPLES)

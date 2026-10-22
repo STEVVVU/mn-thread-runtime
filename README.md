@@ -1,234 +1,74 @@
-# Marl
+# M:N thread runtime
 
-Marl is a hybrid thread / fiber task scheduler written in C++ 11.
+This repository extends Google Marl, a C++11 scheduler for stackful fibers and a fixed pool of worker threads. It adds a locality hint for iterative tasks while keeping tasks stealable when the preferred worker is busy.
 
-## About
+The runtime serves two needs: ordinary work continues through Marl's scheduler, while repeated partitioned work can ask the scheduler to try the worker that handled the same partition before. The hint is advisory. A busy worker can lose the task to a peer.
 
-Marl is a C++ 11 library that provides a fluent interface for running tasks across a number of threads.
+## Schedule a preferred worker
 
-Marl uses a combination of fibers and threads to allow efficient execution of tasks that can block, while keeping a fixed number of hardware threads.
-
-Marl supports Windows, macOS, Linux, FreeBSD, Fuchsia, Emscripten, Android and iOS (arm, aarch64, loongarch64, mips64, ppc64, rv64, x86 and x64).
-
-Marl has no dependencies on other libraries (with an exception on googletest for building the optional unit tests).
-
-Example:
+Configure a Marl scheduler with dedicated workers, then set a hint on each task:
 
 ```cpp
-#include "marl/defer.h"
-#include "marl/event.h"
-#include "marl/scheduler.h"
-#include "marl/waitgroup.h"
+marl::Scheduler::Config config;
+config.setWorkerThreadCount(4);
+marl::Scheduler scheduler(config);
+scheduler.bind();
 
-#include <cstdio>
-
-int main() {
-  // Create a marl scheduler using all the logical processors available to the process.
-  // Bind this scheduler to the main thread so we can call marl::schedule()
-  marl::Scheduler scheduler(marl::Scheduler::Config::allCores());
-  scheduler.bind();
-  defer(scheduler.unbind());  // Automatically unbind before returning.
-
-  constexpr int numTasks = 10;
-
-  // Create an event that is manually reset.
-  marl::Event sayHello(marl::Event::Mode::Manual);
-
-  // Create a WaitGroup with an initial count of numTasks.
-  marl::WaitGroup saidHello(numTasks);
-
-  // Schedule some tasks to run asynchronously.
-  for (int i = 0; i < numTasks; i++) {
-    // Each task will run on one of the 4 worker threads.
-    marl::schedule([=] {  // All marl primitives are capture-by-value.
-      // Decrement the WaitGroup counter when the task has finished.
-      defer(saidHello.done());
-
-      printf("Task %d waiting to say hello...\n", i);
-
-      // Blocking in a task?
-      // The scheduler will find something else for this thread to do.
-      sayHello.wait();
-
-      printf("Hello from task %d!\n", i);
-    });
-  }
-
-  sayHello.signal();  // Unblock all the tasks.
-
-  saidHello.wait();  // Wait for all tasks to complete.
-
-  printf("All tasks said hello.\n");
-
-  // All tasks are guaranteed to complete before the scheduler is destructed.
-}
+marl::Task task([partition] { process(partition); });
+task.setPreferredWorker(partition % 4);
+marl::schedule(std::move(task));
 ```
 
-## Benchmarks
+Call `marl::Scheduler::unbind()` before the bound thread exits. Use `Task::setPreferredWorker(-1)` to clear the hint. A single-threaded scheduler ignores hints. `SameThread` tasks still run on the thread that schedules them.
 
-Graphs of several microbenchmarks can be found [here](https://google.github.io/marl/benchmarks).
+`Scheduler::affinityStats()` returns cumulative counts for tasks that have a hint: executions on the preferred worker, executions stolen by another worker, and duplicate references skipped after the task has already run. The counters are snapshots. Duplicate skips can lag task completion until a worker drains the losing queue entry.
 
-## Building
+## How the scheduler handles a hint
 
-Marl contains many unit tests and examples that can be built using CMake.
+The scheduler puts one shared task record in two places: the preferred worker's FIFO mailbox and its normal stealable queue. The record contains an atomic claim flag. The first worker to claim it runs the body. The other reference is skipped and released. Sleeping peers receive a wake signal so they can steal work instead of waiting for an unrelated task.
 
-Unit tests require fetching the `googletest` external project, which can be done by typing the following in your terminal:
+This follows the affinity mailbox and duplicate queue entry in Acar, Blelloch, and Blumofe's [The Data Locality of Work Stealing](https://www.cs.cmu.edu/~blelloch/papers/locality2000.pdf), section 7.1. This bounded implementation does not prove the paper's theorem or reproduce its speedups. It uses mutex-protected queues and allocates a shared record for each hinted task. See [the scheduling design](docs/architecture.md) for queue and ownership details.
 
-```bash
-cd <path-to-marl>
-git submodule update --init
+The coursework context is the CMU 15-418 M:N fiber assignment described in [the course project report](https://wc-0904.github.io/). This repository does not reuse the student implementation.
+
+## Build and run
+
+Use Visual Studio 2022 Build Tools with CMake on Windows:
+
+```powershell
+git submodule update --init third_party/googletest
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DMARL_BUILD_EXAMPLES=ON -DMARL_BUILD_TESTS=ON
+cmake --build build --config Release --target marl-unittests mn_thread_runtime_tests
+ctest --test-dir build -C Release --output-on-failure
 ```
 
-### Linux and macOS
+The maintained consumer checks fibers and nested waits with 1, 2, and 4 workers, same-thread execution, owner-thread fiber resumption, stealing while the preferred worker is busy, duplicate reclamation, and shutdown drain. Run the real consumer driver to include a bounded process timeout and retained evidence:
 
-To build the unit tests and examples, type the following in your terminal:
-
-```bash
-cd <path-to-marl>
-mkdir build
-cd build
-cmake .. -DMARL_BUILD_EXAMPLES=1 -DMARL_BUILD_TESTS=1
-make
+```powershell
+powershell -ExecutionPolicy Bypass -File .agents/skills/verify-mn-thread-runtime/scripts/verify.ps1 -Doctor
+powershell -ExecutionPolicy Bypass -File .agents/skills/verify-mn-thread-runtime/scripts/verify.ps1
 ```
 
-The resulting binaries will be found in `<path-to-marl>/build`
+To run the stencil workload and emit CSV measurements:
 
-### Emscripten
-
-1. install and activate the emscripten sdk following [standard instructions for your platform](https://emscripten.org/docs/getting_started/downloads.html).
-2. build an example from the examples folder using emscripten, say `hello_task`. 
-```bash
-cd <path-to-marl>
-mkdir build
-cd build
-emcmake cmake .. -DMARL_BUILD_EXAMPLES=1
-make hello_task -j 8
-```
-NOTE: you want to change the value of the linker flag `sPTHREAD_POOL_SIZE` that must be at least as large as the number of threads used by your application.
-3. Test the emscripten output.
-You can use the provided python script to create a local web server:
-```bash
-../run_webserver
-```
-In your browser, navigate to the example URL: [http://127.0.0.1:8080/hello_task.html](http://127.0.0.1:8080/hello_task.html).  
-Voilà - you should see the log output appear on the web page.
-
-### Installing Marl (vcpkg)
-
-Alternatively, you can build and install Marl using [vcpkg](https://github.com/Microsoft/vcpkg/) dependency manager:
-
-```bash or powershell
-git clone https://github.com/Microsoft/vcpkg.git
-cd vcpkg
-./bootstrap-vcpkg.sh
-./vcpkg integrate install
-./vcpkg install marl
+```powershell
+build/Release/mn_thread_runtime_tests.exe --benchmark
 ```
 
-The Marl port in vcpkg is kept up to date by Microsoft team members and community contributors. If the version is out of date, please [create an issue or pull request](https://github.com/Microsoft/vcpkg) on the vcpkg repository.
+## Measured evidence
 
-### Windows
+The native stencil run used 24 logical processors. Every result matched the serial checksum. The table shows the median and full range from five alternating pairs:
 
-Marl can be built using [Visual Studio 2019's CMake integration](https://docs.microsoft.com/en-us/cpp/build/cmake-projects-in-visual-studio?view=vs-2019).
+| Workers | Ordinary scheduling, ms | Preferred worker, ms |
+| ---: | ---: | ---: |
+| 1 | 0.7803 (0.7680–1.3655) | 0.7663 (0.7593–1.1922) |
+| 2 | 0.5289 (0.5187–0.5556) | 0.4994 (0.4871–0.9009) |
+| 4 | 0.5704 (0.4804–0.8456) | 0.4496 (0.4134–0.4740) |
 
-### Using Marl in your CMake project
+These sub-millisecond synthetic results do not establish a latency improvement. The benchmark shows more repeated worker reuse with hints, and it records steals when another worker wins. It does not profile the limiting cost or measure cache misses, NUMA traffic, or a production workload. See the [full run notes and all samples](docs/evidence/p25-verification.md).
 
-You can build and link Marl using `add_subdirectory()` in your project's `CMakeLists.txt` file:
+## Upstream source and maintenance
 
-```cmake
-set(MARL_DIR <path-to-marl>) # example <path-to-marl>: "${CMAKE_CURRENT_SOURCE_DIR}/third_party/marl"
-add_subdirectory(${MARL_DIR})
-```
+This repository retains the complete Google Marl source tree and history at base commit `b8406ab0a82524170ead6dd6c371b579bbc28b3e`. The original project README is preserved in [README.upstream.md](README.upstream.md). Keep the Apache-2.0 license and upstream notices with the source.
 
-This will define the `marl` library target, which you can pass to `target_link_libraries()`:
-
-```cmake
-target_link_libraries(<target> marl) # replace <target> with the name of your project's target
-```
-
-You may also wish to specify your own paths to the third party libraries used by `marl`.
-You can do this by setting any of the following variables before the call to `add_subdirectory()`:
-
-```cmake
-set(MARL_THIRD_PARTY_DIR <third-party-root-directory>) # defaults to ${MARL_DIR}/third_party
-set(MARL_GOOGLETEST_DIR  <path-to-googletest>)         # defaults to ${MARL_THIRD_PARTY_DIR}/googletest
-add_subdirectory(${MARL_DIR})
-```
-
-### Usage Recommendations
-
-#### Capture marl synchronization primitives by value
-
-All marl synchronization primitives aside from `marl::ConditionVariable` should be lambda-captured by **value**:
-
-```c++
-marl::Event event;
-marl::schedule([=]{ // [=] Good, [&] Bad.
-  event.signal();
-})
-```
-
-Internally, these primitives hold a shared pointer to the primitive state. By capturing by value we avoid common issues where the primitive may be destructed before the last reference is used.
-
-#### Create one instance of `marl::Scheduler`, use it for the lifetime of the process
-
-The `marl::Scheduler` constructor can be expensive as it may spawn a number of hardware threads. \
-Destructing the `marl::Scheduler` requires waiting on all tasks to complete.
-
-Multiple `marl::Scheduler`s may fight each other for hardware thread utilization.
-
-For these reasons, it is recommended to create a single `marl::Scheduler` for the lifetime of your process.
-
-For example:
-
-```c++
-int main() {
-  marl::Scheduler scheduler(marl::Scheduler::Config::allCores());
-  scheduler.bind();
-  defer(scheduler.unbind());
-
-  return do_program_stuff();
-}
-```
-
-#### Bind the scheduler to externally created threads
-
-In order to call `marl::schedule()` the scheduler must be bound to the calling thread. Failure to bind the scheduler to the thread before calling `marl::schedule()` will result in undefined behavior.
-
-`marl::Scheduler` may be simultaneously bound to any number of threads, and the scheduler can be retrieved from a bound thread with `marl::Scheduler::get()`.
-
-A typical way to pass the scheduler from one thread to another would be:
-
-```c++
-std::thread spawn_new_thread() {
-  // Grab the scheduler from the currently running thread.
-  marl::Scheduler* scheduler = marl::Scheduler::get();
-
-  // Spawn the new thread.
-  return std::thread([=] {
-    // Bind the scheduler to the new thread.
-    scheduler->bind();
-    defer(scheduler->unbind());
-
-    // You can now safely call `marl::schedule()`
-    run_thread_logic();
-  });
-}
-
-```
-
-Always remember to unbind the scheduler before terminating the thread. Forgetting to unbind will result in the `marl::Scheduler` destructor blocking indefinitely.
-
-#### Don't use externally blocking calls in marl tasks
-
-The `marl::Scheduler` internally holds a number of worker threads which will execute the scheduled tasks. If a marl task becomes blocked on a marl synchronization primitive, marl can yield from the blocked task and continue execution of other scheduled tasks.
-
-Calling a non-marl blocking function on a marl worker thread will prevent that worker thread from being able to switch to execute other tasks until the blocking function has returned. Examples of these non-marl blocking functions include: [`std::mutex::lock()`](https://en.cppreference.com/w/cpp/thread/mutex/lock), [`std::condition_variable::wait()`](https://en.cppreference.com/w/cpp/thread/condition_variable/wait), [`accept()`](http://man7.org/linux/man-pages/man2/accept.2.html).
-
-Short blocking calls are acceptable, such as a mutex lock to access a data structure. However be careful that you do not use a marl blocking call with a `std::mutex` lock held - the marl task may yield with the lock held, and block other tasks from re-locking the mutex. This sort of situation may end up with a deadlock.
-
-If you need to make a blocking call from a marl worker thread, you may wish to use [`marl::blocking_call()`](https://github.com/google/marl/blob/main/include/marl/blockingcall.h), which will spawn a new thread for performing the call, allowing the marl worker to continue processing other scheduled tasks.
-
----
-
-Note: This is not an officially supported Google product
+Google archived Marl on April 27, 2026. This repository preserves that source and carries a local scheduling extension. See [`LICENSE`](LICENSE) and the upstream change history for the applicable notices and authorship.
