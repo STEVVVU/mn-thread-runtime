@@ -10,3 +10,6 @@ CMakeSettings.json
 /.idea/
 MODULE.bazel.lock
 .audit/
+
+__pycache__/
+*.py[cod]
