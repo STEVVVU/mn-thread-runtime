@@ -17,8 +17,8 @@ and reuse counters describe observed workers, not cache/NUMA performance.
 Samples shorter than 10ms are flagged; they cannot establish a kernel speedup.
 
 The workflow's `profile_only=true` input builds/tests the real consumer and
-profiles the frozen two-worker4096-cell/256-step/256-tasks-per-worker/zero-round
-control with Callgrind under a300-second deadline. Raw instruction counts,
+profiles the frozen two-worker 4096-cell/256-step/256-tasks-per-worker/zero-round
+control with Callgrind under a 300-second deadline. Raw instruction counts,
 annotation, source/binary identity, consumer correctness output and explicit
 exit receipt survive failure. Instrumented timing columns are diagnostic only.
 This separates allocation/queue/synchronization instruction cost from the prior
@@ -33,6 +33,16 @@ randomly interleaved repetitions, process CPU/wall time, throughput and native
 JSON; no custom timing/report engine is added. Scheduler creation and final
 losing-reference drain are outside the calibrated loop. Full task/fiber and
 reclamation correctness remains the maintained consumer's oracle.
+
+Use `framework_profile=true` for separate one-worker ordinary and hinted
+Callgrind runs of the same fixture. The existing pinned framework accepts
+`--benchmark_min_time=256x`, which fixes each mode at 256 batches (131072
+callbacks), without warmup or calibration. Each mode has its own 300-second cap,
+fair profiler scheduling, periodic counter dumps, native JSON and exit receipt.
+Instruction totals include startup and final drain; instrumented timing columns
+are excluded from performance comparisons. Both modes are attempted and failed
+profiles remain retained. This path is diagnostic and does not replace the
+five-repeat native framework run.
 
 The pinned implementation already supports these flags and APIs. See its
 [command flags](https://github.com/google/benchmark/blob/2dd015dfef425c866d9a43f2c67d8b52d709acb6/src/benchmark.cc)

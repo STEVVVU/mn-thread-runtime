@@ -1,0 +1,6 @@
+{
+  "passed": true,
+  "exit_code": 0,
+  "purpose": "separate diagnostic; instrumented timings excluded",
+  "command": "timeout 300 valgrind --tool=callgrind build/mn_thread_runtime_tests --benchmark-metrics 2 4096 256 256 0"
+}

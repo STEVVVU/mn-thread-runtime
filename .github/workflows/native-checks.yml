@@ -17,6 +17,10 @@ on:
         description: Run the pinned Google Benchmark hinted fork/join cases
         type: boolean
         default: false
+      framework_profile:
+        description: Separately profile 256 fork/join batches per one-worker mode
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -47,18 +51,18 @@ jobs:
         run: ctest --test-dir build -C Release --output-on-failure --timeout 120
 
   metrics:
-    if: inputs.metrics || inputs.profile_only || inputs.framework
+    if: inputs.metrics || inputs.profile_only || inputs.framework || inputs.framework_profile
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - run: git submodule update --init third_party/googletest
-      - if: inputs.framework
+      - if: inputs.framework || inputs.framework_profile
         run: git submodule update --init third_party/benchmark
-      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMARL_BUILD_EXAMPLES=ON -DMARL_BUILD_TESTS=ON -DMARL_BUILD_BENCHMARKS=${{ inputs.framework && 'ON' || 'OFF' }}
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMARL_BUILD_EXAMPLES=ON -DMARL_BUILD_TESTS=ON -DMARL_BUILD_BENCHMARKS=${{ (inputs.framework || inputs.framework_profile) && 'ON' || 'OFF' }}
       - run: cmake --build build --parallel 2 --target mn_thread_runtime_tests marl-unittests
       - run: ctest --test-dir build --output-on-failure --timeout 120
-      - if: ${{ !inputs.profile_only && !inputs.framework }}
+      - if: ${{ !inputs.profile_only && !inputs.framework && !inputs.framework_profile }}
         run: python3 .agents/skills/verify-mn-thread-runtime/scripts/metrics.py --exe build/mn_thread_runtime_tests --output .agents/runs/metrics-${{ github.run_id }}
       - name: Pinned Google Benchmark scheduling comparison
         if: inputs.framework
@@ -70,23 +74,60 @@ jobs:
           { git rev-parse HEAD; git submodule status third_party/benchmark; lscpu; c++ --version; sha256sum build/marl-benchmarks; } > "$evidence/framework-environment.txt"
           timeout 180 build/marl-benchmarks --benchmark_filter='^Schedule/HintedForkJoin/' --benchmark_min_time=0.5s --benchmark_min_warmup_time=0.1 --benchmark_repetitions=5 --benchmark_enable_random_interleaving=true --benchmark_out="$evidence/google-benchmark.json" --benchmark_out_format=json > "$evidence/google-benchmark.log" 2>&1
           python3 - "$evidence/google-benchmark.json" <<'PY'
-          import collections, json, os, sys
+          import collections, json, math, os, sys
           data = json.load(open(sys.argv[1]))
           rows = [row for row in data['benchmarks'] if row['run_type'] == 'iteration']
           expected = 2 * sum(n <= os.cpu_count() for n in (1, 2, 4))
           counts = collections.Counter(row['run_name'] for row in rows)
           assert len(counts) == expected and all(n == 5 for n in counts.values())
-          assert all(not row.get('error_occurred') and row['real_time'] > 0 and row['items_per_second'] > 0 for row in rows)
+          assert all(not row.get('error_occurred') and all(math.isfinite(row[key]) and row[key] > 0 for key in ('real_time', 'cpu_time', 'items_per_second')) for row in rows)
+          PY
+      - name: Separate fixed-iteration one-worker profiles
+        if: inputs.framework_profile
+        shell: bash
+        run: |
+          evidence=".agents/runs/metrics-${{ github.run_id }}"
+          mkdir -p "$evidence"
+          cmake --build build --parallel 2 --target marl-benchmarks
+          sudo apt-get update
+          sudo apt-get install --yes valgrind
+          { git rev-parse HEAD; git submodule status third_party/benchmark; lscpu; c++ --version; valgrind --version; sha256sum build/marl-benchmarks; } > "$evidence/framework-profile-environment.txt"
+          failed=0
+          for mode in 0 1; do
+            prefix="$evidence/framework-callgrind-$mode"
+            command=(timeout 300 valgrind --tool=callgrind --fair-sched=yes --dump-every-bb=1000000000 --callgrind-out-file="$prefix.out" --log-file="$prefix.log" build/marl-benchmarks "--benchmark_filter=^Schedule/HintedForkJoin/tasks:512/threads:1/hinted:$mode/" --benchmark_min_time=256x --benchmark_min_warmup_time=0 --benchmark_repetitions=1 --benchmark_out="$prefix.json" --benchmark_out_format=json)
+            printf '%q ' "${command[@]}" > "$prefix.command.txt"
+            set +e
+            "${command[@]}" > "$prefix.stdout" 2> "$prefix.stderr"
+            status=$?
+            set -e
+            python3 -c 'import json,sys; json.dump(dict(passed=int(sys.argv[1])==0,exit_code=int(sys.argv[1]),hinted=int(sys.argv[2]),batches=256,callbacks_per_batch=512,purpose="separate diagnostic; instrumented timings excluded"),open(sys.argv[3],"w"),indent=2)' "$status" "$mode" "$prefix.result.json"
+            if [ "$status" -ne 0 ]; then failed=1; fi
+            for dump in "$prefix.out" "$prefix.out".*; do
+              if [ -f "$dump" ]; then
+                if ! callgrind_annotate --inclusive=yes --auto=yes "$dump" > "$dump.annotation.txt"; then failed=1; fi
+              fi
+            done
+          done
+          test "$failed" -eq 0
+          python3 - "$evidence" <<'PY'
+          import json, pathlib, sys
+          for mode in (0, 1):
+              data = json.loads((pathlib.Path(sys.argv[1]) / f'framework-callgrind-{mode}.json').read_text())
+              rows = [row for row in data['benchmarks'] if row['run_type'] == 'iteration']
+              assert len(rows) == 1 and rows[0]['iterations'] == 256
+              assert not rows[0].get('error_occurred')
+              assert f'/threads:1/hinted:{mode}/' in rows[0]['run_name']
           PY
       - name: Separate synchronization profile
-        if: ${{ !inputs.framework }}
+        if: ${{ !inputs.framework && !inputs.framework_profile }}
         run: |
           mkdir -p .agents/runs/metrics-${{ github.run_id }}
           sudo apt-get update
           sudo apt-get install --yes strace
           timeout 240 strace -f -c build/mn_thread_runtime_tests --benchmark-metrics 2 131072 256 16 8 > .agents/runs/metrics-${{ github.run_id }}/profile.csv 2> .agents/runs/metrics-${{ github.run_id }}/profile.log
       - name: Separate tiny-task instruction profile
-        if: ${{ !inputs.framework }}
+        if: ${{ !inputs.framework && !inputs.framework_profile }}
         shell: bash
         run: |
           evidence=".agents/runs/metrics-${{ github.run_id }}"

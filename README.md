@@ -75,9 +75,14 @@ The overlapping ranges show no measurable benefit from hints in this cell.
 Serial control medians were 626.3..630.2 ms. Hints were slower in the tiny-task
 control (4096 cells, zero recurrence rounds, 256 tasks per worker): with two
 workers, ordinary scheduling took 29.63 (26.07..31.75) ms versus 59.23
-(58.28..60.07) ms with hints. A separate instruction profile is pending before
-attributing that loss or changing the runtime. More observed worker reuse does
-not establish a cache or NUMA benefit. Process peak RSS across the matrix was
+(58.28..60.07) ms with hints. A [separate instruction profile](docs/evidence/linux-39729878037/)
+completed but was dominated by the scheduler's time-based idle spinning under
+instrumentation; it does not isolate the native cause of that loss. A narrow
+comparison now reuses the pinned Google Benchmark `Schedule/HintedForkJoin`
+fixture (`framework=true` in Native checks), retaining the consumer's ownership
+oracle. No runtime optimization was accepted from the distorted profile.
+More observed worker reuse does not establish a cache or NUMA benefit.
+Process peak RSS across the matrix was
 4664..8544 KiB, including serial controls and scheduler creation.
 
 Reproduce the complete 39-configuration matrix after a Release build:
@@ -92,6 +97,27 @@ retain every measured configuration, resource scope and exact source identity.
 Kernel timers exclude scheduler creation and serial controls; the matrix covers
 synthetic working-set/granularity controls, not a production workload. Historical
 short-run evidence remains in [the first verification notes](docs/evidence/p25-verification.md).
+
+The [Google Benchmark run](https://github.com/STEVVVU/mn-thread-runtime/actions/runs/39732515159)
+used the same Ubuntu/GCC configuration and a four-logical-CPU AMD EPYC 9V45 VM.
+Five randomly interleaved repetitions, each calibrated for at least 0.5 seconds
+after 0.1 seconds of warmup, measured 512 joined empty callbacks per batch:
+
+| Workers | Ordinary, µs/batch | Preferred worker, µs/batch |
+| ---: | ---: | ---: |
+| 1 | 118.1 (115.4..121.9) | 231.1 (225.1..244.7) |
+| 2 | 122.3 (107.4..127.1) | 229.1 (223.5..245.0) |
+| 4 | 114.4 (113.4..115.5) | 239.5 (238.0..241.3) |
+
+Values are medians (full ranges) from thousands of batches per repetition,
+excluding scheduler creation and final reference drain. Hints cost about
+1.87..2.09 times the ordinary path here; ordinary scheduling remains the default.
+The one-worker penalty rules out peer wakeups as its sole cause. The hint path's
+shared claim record, duplicate queues and exact-once claim also apply with one
+worker; their individual native costs remain unresolved. Empty callbacks do
+not establish locality or production-workload performance. Both CTest suites
+passed before measurement. [All 30 samples, process CPU costs, exact command,
+source/binary identity and hashes](docs/evidence/linux-39732515159/) are retained.
 
 ## Upstream source and maintenance
 
