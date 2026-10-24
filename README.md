@@ -1,5 +1,125 @@
 # M:N thread runtime
 
+## Contents
+
+- [Architecture and execution guide](#architecture-and-execution-guide)
+- [Schedule a preferred worker](#schedule-a-preferred-worker)
+- [How the scheduler handles a hint](#how-the-scheduler-handles-a-hint)
+- [Build and run](#build-and-run)
+- [Measured evidence](#measured-evidence)
+- [Upstream source and maintenance](#upstream-source-and-maintenance)
+
+## Architecture and execution guide
+
+This repository extends the preserved Google Marl fiber scheduler with an advisory [preferred-worker](#preferred-worker) hint. Marl owns worker threads, fiber switching, task queues, and [work stealing](#work-stealing). The extension adds an [affinity mailbox](#mailbox) entry and a shared [exact-once claim](#exact-once-claim) record for hinted tasks. [Same-thread tasks](#same-thread-task) retain their existing scheduling behavior.
+
+The hint changes task routing inside Marl rather than replacing its worker runtime.
+
+```mermaid
+flowchart LR
+Caller["Consumer schedules task"] --> API["Task preferred-worker hint"]
+API --> Scheduler["Marl scheduler"]
+Scheduler --> Mailbox["Preferred worker mailbox"]
+Scheduler --> Queue["Normal stealable queue"]
+Mailbox --> Worker["Worker claims and runs task"]
+Queue --> Worker
+Worker --> Fiber["Marl fiber execution"]
+```
+
+A hinted task has one shared record referenced from the preferred worker's FIFO mailbox and the ordinary stealable queue. Both routes can race to claim it, but only the first successful atomic claim executes the body. A worker that loses skips the duplicate record and releases its reference. If the preferred worker is busy, a peer can steal from the normal queue. Sleeping peers receive a wake signal so they can look for work. Affinity statistics are cumulative snapshots, and duplicate-skip counts can lag until a losing queue entry drains.
+
+```mermaid
+flowchart TD
+subgraph API["Task API"]
+Hint["Set preferred worker"] --> Schedule["Schedule task"]
+Clear["Set hint to -1"] --> Schedule
+end
+subgraph Scheduler["Queue and ownership"]
+Schedule --> Route{"Eligible preferred-worker hint?"}
+Route -->|"yes"| Record["Create shared task record with atomic claim"]
+Route -->|"cleared hint or same-thread task"| Ordinary["Use existing scheduling path"]
+Record --> Mailbox["Enqueue preferred mailbox reference"]
+Record --> Stealable["Enqueue normal stealable reference"]
+end
+subgraph Workers["Worker lifecycle"]
+Mailbox --> Claim["Attempt exact-once claim"]
+Stealable --> Claim
+Claim -->|"won"| Run["Run task body"]
+Claim -->|"lost"| Skip["Skip duplicate and release reference"]
+Busy["Preferred worker busy"] --> Steal["Peer steals normal queue entry"]
+Steal --> Claim
+Sleep["Peer waiting"] --> Wake["Signal peer to check work"]
+Wake --> Steal
+end
+Run --> Stats["Update hinted execution counters"]
+Skip --> Stats
+Ordinary --> Existing["Existing Marl task execution"]
+```
+
+| Subsystem | Responsibility and owned invariant | Source |
+| --- | --- | --- |
+| Task API | Store or clear the preferred worker index on a task | [`task.h`](include/marl/task.h) |
+| Scheduler | Route hinted records to mailbox and stealable queues while retaining same-thread semantics | [`scheduler.cpp`](src/scheduler.cpp) |
+| Worker queues | Own queue references and support stealing and worker wakeups | [`scheduler.cpp`](src/scheduler.cpp) |
+| Fiber execution | Run the claimed body through Marl's existing fiber scheduler | [`scheduler.h`](include/marl/scheduler.h) |
+| Consumer checks | Exercise hints, stealing, duplicate reclamation, and shutdown drain | [`mn_thread_runtime_tests.cpp`](examples/mn_thread_runtime_tests.cpp) |
+
+### Follow a hinted task
+
+1. The consumer configures and binds a Marl scheduler, creates a task, and sets a worker index. `-1` clears the hint; a single-thread scheduler ignores it.
+2. Scheduling creates the shared task record and queues one reference in the preferred mailbox and one in the normal work queue.
+3. The preferred worker or a stealing peer attempts the atomic claim. The winner runs the task once.
+4. The other queue entry later observes the completed claim, skips execution, and releases its reference. Its counter may update after task completion.
+5. Shutdown drains remaining queue references; the consumer unbinds a bound scheduler thread before it exits.
+
+<a id="preferred-worker"></a>
+<details><summary>What is a preferred worker?</summary>
+
+A preferred worker is the worker the scheduler tries first for a hinted task. The hint is advisory; if that worker is busy, another worker can steal the task.
+</details>
+
+<a id="mailbox"></a>
+<details><summary>What is the affinity mailbox?</summary>
+
+The affinity mailbox is a FIFO queue tied to a worker. A hinted task adds one reference there, while another reference stays in the normal queue so peers can steal it.
+</details>
+
+<a id="work-stealing"></a>
+<details><summary>What is work stealing?</summary>
+
+Work stealing lets an idle worker take runnable work from a peer's queue. Marl uses the normal queue as the fallback route when a preferred worker is occupied.
+</details>
+
+<a id="exact-once-claim"></a>
+<details><summary>What is the exact-once claim?</summary>
+
+The shared task record contains an atomic claim flag. The first worker that claims it runs the body; the second queue reference cannot run it again.
+</details>
+
+<a id="same-thread-task"></a>
+<details><summary>What is a same-thread task?</summary>
+
+A same-thread task must run on the thread that schedules it. The preferred-worker hint does not override this existing task mode.
+</details>
+
+<a id="affinity-counter"></a>
+<details><summary>What is an affinity counter?</summary>
+
+An affinity counter records hinted executions on the preferred worker, steals by another worker, or skipped duplicate references. A duplicate-skip count can lag while the losing reference remains queued.
+</details>
+
+### Design choices and limits
+
+These rationales are inferred from implementation; the cited paper is the source of the mailbox pattern, not proof of this implementation's performance.
+
+| Choice | Current behavior and rationale | Alternative and cost to reconsider |
+| --- | --- | --- |
+| Advisory hint instead of pinning | Keeps normal stealing available when the target worker is busy. | Strict pinning can preserve placement but risks idle workers and delayed tasks. |
+| Duplicate queue references | Gives the preferred worker a direct route and keeps a stealable fallback. | Single-queue routing avoids duplicates but needs a separate handoff when the target is busy. |
+| Shared record with atomic claim | Makes competing routes execute the body once. | Moving tasks between queues avoids shared claim state but adds transfer synchronization. |
+| Mutex-protected queues | Reuses Marl's queue and ownership structure. | Lock-free queues require different reclamation and contention evidence. |
+| Cumulative advisory statistics | Exposes observed placement without synchronizing task completion. | Exact live counters add synchronization and still do not prove hardware locality. |
+
 This repository extends Google Marl, a C++11 scheduler for stackful fibers and a fixed pool of worker threads. It adds a locality hint for iterative tasks while keeping tasks stealable when the preferred worker is busy.
 
 The runtime serves two needs: ordinary work continues through Marl's scheduler, while repeated partitioned work can ask the scheduler to try the worker that handled the same partition before. The hint is advisory. A busy worker can lose the task to a peer.
