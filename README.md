@@ -12,6 +12,276 @@
 
 ## Architecture and execution guide
 
+<!-- execution-flow:start -->
+### Execution flow
+
+Start with the primary path, then expand a detailed workflow. Select a numbered node to see its operation, implementation techniques, and source. Solid arrows show the named control, data, or lifecycle handoff; dotted arrows show error paths. Separate entry points are named in each workflow.
+
+<a id="review-walkthrough"></a>
+
+#### Walk through one concrete example
+
+A scheduler submits an eligible task with worker 2 as its preferred worker while that worker is busy.
+
+**Trace.** [Set preferred worker hint](#flow-step-set-hint) → [Route task by flags and hint](#flow-step-route-task) → [Publish both affinity entries](#flow-step-publish-dual-entry) → [Wake peers to check for steals](#flow-step-wake-peers) → [Steal eligible peer work](#flow-step-steal-entry) → [Run task on worker fiber](#flow-step-execute-fiber) → [Claim once or discard duplicate](#flow-step-claim-or-skip) → [Suspend and resume waiting fiber](#flow-step-cooperative-wait).
+
+**Result and boundary.** The task is published to affinity and ordinary queues, peers are woken, and an eligible peer can steal and execute it. The claim step suppresses duplicate execution, and a waiting fiber resumes on its owner worker; the preferred worker hint does not guarantee placement.
+
+<details>
+<summary>Implementation decisions to explain</summary>
+
+**Why publish both affinity and ordinary queue entries?** The preferred worker can find the affinity entry while other workers can still find ordinary work if it is unavailable. The hint improves routing opportunity but is nonbinding and adds duplicate queue bookkeeping.
+
+[Advisory worker hints](#technique-preferred-worker).
+
+**Why claim the task after it can be stolen?** The same task may be reachable through more than one queue entry, so an atomic claim lets only one worker execute it. The claim adds coordination to each competing execution attempt.
+
+[Atomic claim and shared-record reclamation](#technique-exact-once-claim).
+
+</details>
+
+#### Primary execution flow
+
+A task hint enters Marl's preferred mailbox and ordinary stealable queue; either route can claim and execute it once, while the other reference is later released. Ordinary tasks and verification are separate paths.
+
+```mermaid
+flowchart TD
+    n1["1. Set preferred worker hint"]
+    click n1 href "https://github.com/STEVVVU/mn-thread-runtime#flow-step-set-hint" "Open step, techniques, and source" _top
+    n2["2. Route task by flags and hint"]
+    click n2 href "https://github.com/STEVVVU/mn-thread-runtime#flow-step-route-task" "Open step, techniques, and source" _top
+    n3["3. Publish both affinity entries"]
+    click n3 href "https://github.com/STEVVVU/mn-thread-runtime#flow-step-publish-dual-entry" "Open step, techniques, and source" _top
+    n4["4. Wake peers to check for<br/>steals"]
+    click n4 href "https://github.com/STEVVVU/mn-thread-runtime#flow-step-wake-peers" "Open step, techniques, and source" _top
+    n5["5. Claim once or discard<br/>duplicate"]
+    click n5 href "https://github.com/STEVVVU/mn-thread-runtime#flow-step-claim-or-skip" "Open step, techniques, and source" _top
+    n6["6. Steal eligible peer work"]
+    click n6 href "https://github.com/STEVVVU/mn-thread-runtime#flow-step-steal-entry" "Open step, techniques, and source" _top
+    n7["7. Run task on worker fiber"]
+    click n7 href "https://github.com/STEVVVU/mn-thread-runtime#flow-step-execute-fiber" "Open step, techniques, and source" _top
+    n8["8. Suspend and resume waiting<br/>fiber"]
+    click n8 href "https://github.com/STEVVVU/mn-thread-runtime#flow-step-cooperative-wait" "Open step, techniques, and source" _top
+    n1 -->|"task is scheduled"| n2
+    n2 -->|"multiworker scheduler and valid<br/>nonnegative hint"| n3
+    n3 -->|"both queue entries published"| n4
+    n3 -->|"preferred worker dequeues affinity<br/>mailbox reference"| n7
+    n4 -->|"peer wakes and finds stealable queue<br/>work"| n6
+    n6 -->|"stolen queue entry executed on<br/>stealing worker"| n7
+    n5 -->|"winning callback uses a<br/>scheduler-aware wait"| n8
+    n7 -->|"affinity task enters execute"| n5
+    n2 -->|"SameThread or ordinary task enters a<br/>worker queue"| n7
+```
+
+**Detailed workflows.** [Preferred-worker task routing and claim](#flow-workflow-hinted-task) · [Verify scheduler behavior with the consumer](#flow-workflow-consumer-verification) · [Independent statistics and shutdown calls](#flow-workflow-lifecycle-and-stats).
+
+<a id="flow-workflow-hinted-task"></a>
+
+<details>
+<summary>Preferred-worker task routing and claim</summary>
+
+A task hint enters Marl's preferred mailbox and ordinary stealable queue; either route can claim and execute it once, while the other reference is later released. Ordinary tasks and verification are separate paths.
+
+```mermaid
+flowchart TD
+    n1["1. Set preferred worker hint"]
+    click n1 href "https://github.com/STEVVVU/mn-thread-runtime#flow-step-set-hint" "Open step, techniques, and source" _top
+    n2["2. Route task by flags and hint"]
+    click n2 href "https://github.com/STEVVVU/mn-thread-runtime#flow-step-route-task" "Open step, techniques, and source" _top
+    n3["3. Publish both affinity entries"]
+    click n3 href "https://github.com/STEVVVU/mn-thread-runtime#flow-step-publish-dual-entry" "Open step, techniques, and source" _top
+    n4["4. Wake peers to check for<br/>steals"]
+    click n4 href "https://github.com/STEVVVU/mn-thread-runtime#flow-step-wake-peers" "Open step, techniques, and source" _top
+    n5["5. Claim once or discard<br/>duplicate"]
+    click n5 href "https://github.com/STEVVVU/mn-thread-runtime#flow-step-claim-or-skip" "Open step, techniques, and source" _top
+    n6["6. Steal eligible peer work"]
+    click n6 href "https://github.com/STEVVVU/mn-thread-runtime#flow-step-steal-entry" "Open step, techniques, and source" _top
+    n7["7. Run task on worker fiber"]
+    click n7 href "https://github.com/STEVVVU/mn-thread-runtime#flow-step-execute-fiber" "Open step, techniques, and source" _top
+    n8["8. Suspend and resume waiting<br/>fiber"]
+    click n8 href "https://github.com/STEVVVU/mn-thread-runtime#flow-step-cooperative-wait" "Open step, techniques, and source" _top
+    n1 -->|"task is scheduled"| n2
+    n2 -->|"multiworker scheduler and valid<br/>nonnegative hint"| n3
+    n3 -->|"both queue entries published"| n4
+    n3 -->|"preferred worker dequeues affinity<br/>mailbox reference"| n7
+    n4 -->|"peer wakes and finds stealable queue<br/>work"| n6
+    n6 -->|"stolen queue entry executed on<br/>stealing worker"| n7
+    n5 -->|"winning callback uses a<br/>scheduler-aware wait"| n8
+    n7 -->|"affinity task enters execute"| n5
+    n2 -->|"SameThread or ordinary task enters a<br/>worker queue"| n7
+```
+
+</details>
+
+<a id="flow-workflow-consumer-verification"></a>
+
+<details>
+<summary>Verify scheduler behavior with the consumer</summary>
+
+Independent verification executable checks waits, stealing, shutdown, and stencil correctness; it does not run as a runtime dispatcher.
+
+```mermaid
+flowchart TD
+    n11["11. Check races, waits, drain,<br/>and stencil result"]
+    click n11 href "https://github.com/STEVVVU/mn-thread-runtime#flow-step-consumer-oracles" "Open step, techniques, and source" _top
+```
+
+</details>
+
+<a id="flow-workflow-lifecycle-and-stats"></a>
+
+<details>
+<summary>Independent statistics and shutdown calls</summary>
+
+Callers can read atomic placement counters. Scheduler destruction independently initiates worker shutdown and drains queued references and blocked fibers. Neither action follows automatically from one task execution.
+
+```mermaid
+flowchart TD
+    n9["9. Read cumulative placement<br/>counters"]
+    click n9 href "https://github.com/STEVVVU/mn-thread-runtime#flow-step-read-counters" "Open step, techniques, and source" _top
+    n10["10. Drain work before worker<br/>teardown"]
+    click n10 href "https://github.com/STEVVVU/mn-thread-runtime#flow-step-shutdown-drain" "Open step, techniques, and source" _top
+```
+
+</details>
+
+#### Steps, techniques, and source
+
+These source traces cover the active scope below. They explain implementation behavior; benchmark results and their limits remain in the measurement sections.
+
+<a id="flow-step-set-hint"></a>
+
+##### 1. Set preferred worker hint
+
+**Component.** Task::setPreferredWorker. The task stores a worker index or -1 to clear the hint. Scheduler::enqueue validates nonnegative indices against the configured worker count.
+
+**Techniques at this step.** [Advisory worker hints](#technique-preferred-worker).
+
+**Source.** [`include/marl/task.h:125`](https://github.com/STEVVVU/mn-thread-runtime/blob/main/include/marl/task.h#L125) · [`src/scheduler.cpp:171`](https://github.com/STEVVVU/mn-thread-runtime/blob/main/src/scheduler.cpp#L171). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-route-task"></a>
+
+##### 2. Route task by flags and hint
+
+**Component.** Scheduler::enqueue. SameThread tasks enter the current worker queue first. Otherwise a multiworker scheduler routes a valid hint to affinity queues, uses ordinary worker selection without a hint, and a single-thread scheduler requires a bound worker.
+
+**Techniques at this step.** [Same-thread routing precedence](#technique-same-thread-task) · [Advisory worker hints](#technique-preferred-worker).
+
+**Source.** [`src/scheduler.cpp:171`](https://github.com/STEVVVU/mn-thread-runtime/blob/main/src/scheduler.cpp#L171). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-publish-dual-entry"></a>
+
+##### 3. Publish both affinity entries
+
+**Component.** Scheduler::Worker::enqueueAffinity. The scheduler creates one shared AffinityTask and stores references in the preferred worker mailbox and its normal task queue. It adds two to the work count and notifies the worker when required.
+
+**Techniques at this step.** [Mailbox plus stealable queue](#technique-mailbox).
+
+**Source.** [`src/scheduler.cpp:585`](https://github.com/STEVVVU/mn-thread-runtime/blob/main/src/scheduler.cpp#L585). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-wake-peers"></a>
+
+##### 4. Wake peers to check for steals
+
+**Component.** Scheduler::enqueue and Worker::wakeForSteal. After publishing the dual entries, enqueue signals every worker except the preferred worker. Each signal sets stealSignal under the work mutex and notifies its condition variable.
+
+**Techniques at this step.** [Work stealing and peer wakeup](#technique-work-stealing).
+
+**Source.** [`src/scheduler.cpp:188`](https://github.com/STEVVVU/mn-thread-runtime/blob/main/src/scheduler.cpp#L188) · [`src/scheduler.cpp:597`](https://github.com/STEVVVU/mn-thread-runtime/blob/main/src/scheduler.cpp#L597). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-claim-or-skip"></a>
+
+##### 5. Claim once or discard duplicate
+
+**Component.** Scheduler::Worker::execute. Each affinity queue reference competes on one atomic claimed flag. The winner increments preferred or stolen executions and invokes the task; a loser increments duplicateSkips and returns without invoking it.
+
+**Techniques at this step.** [Atomic claim and shared-record reclamation](#technique-exact-once-claim) · [Cumulative placement counters](#technique-affinity-counter).
+
+**Source.** [`src/scheduler.cpp:605`](https://github.com/STEVVVU/mn-thread-runtime/blob/main/src/scheduler.cpp#L605). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-steal-entry"></a>
+
+##### 6. Steal eligible peer work
+
+**Component.** Scheduler::Worker::steal. A worker checks the peer work count and try-locks its queue. It refuses empty queues and ordinary SameThread tasks, otherwise removes the front task and decrements the count.
+
+**Techniques at this step.** [Work stealing and peer wakeup](#technique-work-stealing) · [Same-thread routing precedence](#technique-same-thread-task).
+
+**Source.** [`src/scheduler.cpp:625`](https://github.com/STEVVVU/mn-thread-runtime/blob/main/src/scheduler.cpp#L625). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-execute-fiber"></a>
+
+##### 7. Run task on worker fiber
+
+**Component.** Scheduler::Worker::runUntilIdle and switchToFiber. The worker removes a queued task under its mutex, unlocks while executing it, then releases the queue reference outside the lock. Worker fibers are created on demand and switched on their owning worker.
+
+**Techniques at this step.** [M:N stackful fiber scheduling](#technique-mn-stackful-fibers).
+
+**Source.** [`src/scheduler.cpp:755`](https://github.com/STEVVVU/mn-thread-runtime/blob/main/src/scheduler.cpp#L755) · [`src/scheduler.cpp:821`](https://github.com/STEVVVU/mn-thread-runtime/blob/main/src/scheduler.cpp#L821). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-cooperative-wait"></a>
+
+##### 8. Suspend and resume waiting fiber
+
+**Component.** Scheduler::Worker::suspend and enqueue(Fiber*). A waiting fiber records its state and optional timeout, then the worker runs another queued, idle, or newly created fiber. Notification enqueues the fiber on its owner worker, which resumes it there.
+
+**Techniques at this step.** [Cooperative wait and owner resumption](#technique-cooperative-wait-owner-resumption).
+
+**Source.** [`src/scheduler.cpp:497`](https://github.com/STEVVVU/mn-thread-runtime/blob/main/src/scheduler.cpp#L497) · [`src/scheduler.cpp:540`](https://github.com/STEVVVU/mn-thread-runtime/blob/main/src/scheduler.cpp#L540). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-read-counters"></a>
+
+##### 9. Read cumulative placement counters
+
+**Component.** Scheduler::affinityStats. The accessor returns atomic snapshots of preferred executions, stolen executions, and duplicate skips. A queued losing reference may not be counted until a worker drains it.
+
+**Techniques at this step.** [Cumulative placement counters](#technique-affinity-counter).
+
+**Source.** [`src/scheduler.cpp:222`](https://github.com/STEVVVU/mn-thread-runtime/blob/main/src/scheduler.cpp#L222). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-shutdown-drain"></a>
+
+##### 10. Drain work before worker teardown
+
+**Component.** Scheduler::~Scheduler and Worker::runUntilShutdown. Scheduler destruction waits for bound single-thread workers to unbind, then stops workers in reverse order. A worker continues until shutdown is set and queued work and blocked fibers are drained.
+
+**Techniques at this step.** [Shutdown drain](#technique-shutdown-drain).
+
+**Source.** [`src/scheduler.cpp:151`](https://github.com/STEVVVU/mn-thread-runtime/blob/main/src/scheduler.cpp#L151) · [`src/scheduler.cpp:659`](https://github.com/STEVVVU/mn-thread-runtime/blob/main/src/scheduler.cpp#L659). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-consumer-oracles"></a>
+
+##### 11. Check races, waits, drain, and stencil result
+
+**Component.** mn_thread_runtime_tests consumer. The maintained consumer checks nested waits and owner-thread resumption, affinity stealing and exact callback/capture behavior, shutdown drain, and stencil checksums against a serial oracle. These are verification paths, not production scheduler stages.
+
+**Techniques at this step.** [Exact consumer stressor oracle](#technique-consumer-stressor-oracle).
+
+**Source.** [`examples/mn_thread_runtime_tests.cpp:147`](https://github.com/STEVVVU/mn-thread-runtime/blob/main/examples/mn_thread_runtime_tests.cpp#L147) · [`examples/mn_thread_runtime_tests.cpp:235`](https://github.com/STEVVVU/mn-thread-runtime/blob/main/examples/mn_thread_runtime_tests.cpp#L235) · [`examples/mn_thread_runtime_tests.cpp:326`](https://github.com/STEVVVU/mn-thread-runtime/blob/main/examples/mn_thread_runtime_tests.cpp#L326) · [`.agents/skills/verify-mn-thread-runtime/feature-map.md:1`](https://github.com/STEVVVU/mn-thread-runtime/blob/main/.agents/skills/verify-mn-thread-runtime/feature-map.md#L1). [Back to execution flow](#execution-flow).
+
+<details>
+<summary>Scope and subsystem coverage</summary>
+
+Marl task routing, dual affinity and stealable queues, fiber waits and execution, counters, shutdown drain, and maintained consumer checks.
+
+- **Task API and routing.** Hint and SameThread precedence are traced through Scheduler::enqueue. [Step 1](#flow-step-set-hint), [Step 2](#flow-step-route-task).
+- **M:N fiber worker scheduler and cooperative waits.** Worker-owned fibers execute callbacks and scheduler-aware waits resume through the owning worker. [Step 7](#flow-step-execute-fiber), [Step 8](#flow-step-cooperative-wait).
+- **Preferred queue routing, stealing, and ownership.** The preferred mailbox and ordinary queue share one claim record; peers can steal, and atomic snapshots expose counters. [Step 3](#flow-step-publish-dual-entry), [Step 4](#flow-step-wake-peers), [Step 5](#flow-step-claim-or-skip), [Step 6](#flow-step-steal-entry), [Step 9](#flow-step-read-counters).
+- **Worker lifecycle and shutdown.** Unbinding precedes worker stop and workers drain queued work and blocked fibers. [Step 10](#flow-step-shutdown-drain).
+- **Maintained consumer verification and correctness workload.** Consumer checks race outcomes, waits, drain, and serial stencil checksum. [Step 11](#flow-step-consumer-oracles).
+
+Outside this flow audit:
+
+- `third_party/googletest/**`. Vendored framework implementation is outside active runtime and consumer behavior.
+- `src/*_test.cpp and src/*_bench.cpp`. Upstream subsystem tests and benchmarks are not the maintained consumer path.
+
+</details>
+
+<!-- execution-flow:end -->
+
+<details>
+<summary>Subsystem technique index</summary>
+
 ### Subsystem map
 
 Select a subsystem in the diagram to open its techniques, tradeoffs, and code references. The numbered links provide the same navigation. This map groups components; the execution diagrams show their runtime flow.
@@ -40,6 +310,8 @@ click s5 href "https://github.com/STEVVVU/mn-thread-runtime#subsystem-maintained
 This repository extends the preserved Google Marl fiber scheduler with an advisory [preferred-worker](#preferred-worker) hint. Marl owns worker threads, fiber switching, task queues, and [work stealing](#work-stealing). The extension adds an [affinity mailbox](#mailbox) entry and a shared [exact-once claim](#exact-once-claim) record for hinted tasks. [Same-thread tasks](#same-thread-task) retain their existing scheduling behavior.
 
 The hint changes task routing inside Marl rather than replacing its worker runtime.
+
+</details>
 
 <details>
 <summary>Expand flow diagram 1</summary>
