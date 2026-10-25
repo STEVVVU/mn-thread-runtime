@@ -3,6 +3,7 @@
 ## Contents
 
 - [Architecture and execution guide](#architecture-and-execution-guide)
+- [Implementation techniques](#implementation-techniques)
 - [Schedule a preferred worker](#schedule-a-preferred-worker)
 - [How the scheduler handles a hint](#how-the-scheduler-handles-a-hint)
 - [Build and run](#build-and-run)
@@ -63,6 +64,188 @@ Ordinary --> Existing["Existing Marl task execution"]
 | Worker queues | Own queue references and support stealing and worker wakeups | [`scheduler.cpp`](src/scheduler.cpp) |
 | Fiber execution | Run the claimed body through Marl's existing fiber scheduler | [`scheduler.h`](include/marl/scheduler.h) |
 | Consumer checks | Exercise hints, stealing, duplicate reclamation, and shutdown drain | [`mn_thread_runtime_tests.cpp`](examples/mn_thread_runtime_tests.cpp) |
+
+## Implementation techniques
+
+This section covers the active scheduler, preferred-worker extension, and maintained consumer checks. Marl's stackful fibers and cooperative waits are inherited. Preferred-worker routing and its consumer oracle are local additions. Rationale is inferred from current code. This documentation makes no cache, NUMA, or performance-benefit claim.
+
+| Subsystem | Technique cards | Source files |
+| --- | --- | --- |
+| Task API | [Advisory worker hints](#technique-preferred-worker), [same-thread routing](#technique-same-thread-task) | [`task.h`](include/marl/task.h), [`scheduler.cpp`](src/scheduler.cpp) |
+| Fiber scheduler | [M:N stackful fiber scheduling](#technique-mn-stackful-fibers), [cooperative wait and owner resumption](#technique-cooperative-wait-owner-resumption) | [`scheduler.h`](include/marl/scheduler.h), [`scheduler.cpp`](src/scheduler.cpp) |
+| Preferred queues | [Mailbox plus stealable queue](#technique-mailbox), [work stealing and peer wakeup](#technique-work-stealing), [atomic claim and shared-record reclamation](#technique-exact-once-claim) | [`scheduler.h`](include/marl/scheduler.h), [`scheduler.cpp`](src/scheduler.cpp) |
+| Lifecycle and counters | [Shutdown drain](#technique-shutdown-drain), [cumulative placement counters](#technique-affinity-counter) | [`scheduler.h`](include/marl/scheduler.h), [`scheduler.cpp`](src/scheduler.cpp) |
+| Consumer verification | [Exact consumer stressor oracle](#technique-consumer-stressor-oracle) | [`mn_thread_runtime_tests.cpp`](examples/mn_thread_runtime_tests.cpp) |
+
+<a id="technique-mn-stackful-fibers"></a>
+
+<details>
+<summary>M:N stackful fiber scheduling</summary>
+
+**Mechanism.** Marl runs many task fibers on a fixed set of worker threads. Each worker owns its main fiber, task fibers, and fiber queues. A task can yield by switching its stack to another fiber on that same worker. Completed fibers enter the worker's idle set for reuse.
+
+**Example.** A worker starts a task fiber with `createWorkerFiber()`, then `runUntilIdle()` switches from the scheduler fiber to it. The task may yield and resume on the same worker.
+
+**Why here.** Preferred-worker routing selects a queue while Marl's existing worker executes the task as a fiber.
+
+**Tradeoffs.** Fibers do not migrate between worker threads. They use allocated stacks and scheduler-aware waits; a blocking call inside a task can occupy its worker.
+
+**Code and ownership.** Inherited Marl code in [`scheduler.h`](include/marl/scheduler.h#L354), [`scheduler.cpp`](src/scheduler.cpp#L755), [`scheduler.cpp`](src/scheduler.cpp#L810), and [`scheduler.cpp`](src/scheduler.cpp#L821).
+
+</details>
+
+<a id="technique-cooperative-wait-owner-resumption"></a>
+
+<details>
+<summary>Cooperative wait and owner resumption</summary>
+
+**Mechanism.** A scheduler-aware wait marks the current fiber yielded or waiting, records a timeout when present, and switches the worker to other work. Notification queues the fiber on its owning worker. That worker resumes the fiber rather than transferring its suspended stack to another thread. Predicate waits recheck after wakeups.
+
+**Example.** `Event::wait()` suspends more task fibers than there are workers. After the event is signaled, each worker resumes its own fibers.
+
+**Why here.** Cooperative waits free a worker to run other tasks while a fiber waits and preserve stack ownership.
+
+**Tradeoffs.** Only Marl-aware waits yield. A regular blocking call still blocks its OS worker. The worker-local design limits migration across workers.
+
+**Code and ownership.** Inherited Marl code in [`scheduler.cpp`](src/scheduler.cpp#L497) and [`scheduler.cpp`](src/scheduler.cpp#L540). The consumer checks owner resumption in [`mn_thread_runtime_tests.cpp`](examples/mn_thread_runtime_tests.cpp#L59).
+
+</details>
+
+<a id="technique-preferred-worker"></a>
+
+<details>
+<summary>Advisory worker hints</summary>
+
+**Mechanism.** `Task::setPreferredWorker()` stores a worker index, or `-1` to clear it. The scheduler validates nonnegative indices against its worker count, then routes eligible hinted tasks through that worker's affinity queues. A cleared hint follows ordinary scheduling. `SameThread` tasks take the existing current-worker path first. A single-thread scheduler has no multi-worker routing path.
+
+**Example.** `task.setPreferredWorker(partition % workers)` suggests that tasks for a partition use the same worker index.
+
+**Why here.** The hint exposes a placement preference for iterative partitioned work while leaving the scheduler free to run the task elsewhere.
+
+**Tradeoffs.** A hint is not pinning and guarantees neither worker placement nor hardware locality. Invalid indices fail at scheduling time. Hinted tasks allocate a shared record and use two queue references.
+
+**Code and ownership.** Extension API in [`task.h`](include/marl/task.h#L60) and routing in [`scheduler.cpp`](src/scheduler.cpp#L171).
+
+</details>
+
+<a id="technique-mailbox"></a>
+
+<details>
+<summary>Mailbox plus stealable queue</summary>
+
+**Mechanism.** A hinted task moves into one `AffinityTask` shared record. The preferred worker receives one shared reference in its FIFO affinity mailbox, and its ordinary task queue receives another. Both entries point to the same body and claim flag. The mailbox gives the target a direct route; the ordinary queue remains available to thieves.
+
+**Example.** `enqueueAffinity()` appends the record to both queues and increments the queued-work count by two.
+
+**Why here.** The dual reference keeps a preferred route and a peer-stealable fallback without transferring the record when contention appears.
+
+**Tradeoffs.** Each hinted task adds an allocation, a second queue entry, and a later losing-reference drain. The queues use mutexes.
+
+**Code and ownership.** Extension code in [`scheduler.h`](include/marl/scheduler.h#L334) and [`scheduler.cpp`](src/scheduler.cpp#L585).
+
+</details>
+
+<a id="technique-work-stealing"></a>
+
+<details>
+<summary>Work stealing and peer wakeup</summary>
+
+**Mechanism.** A worker looking for work probes peer queues and can remove an eligible task from a peer's normal task queue. When a hinted task enters the preferred worker's queues, the scheduler signals other workers so sleeping peers check for stealable work. A thief runs that queue reference through the same claim path as the mailbox reference.
+
+**Example.** While worker 0 is held by a consumer blocker, worker 1 steals tasks whose hint names worker 0.
+
+**Why here.** Stealing keeps hinted tasks runnable when the preferred worker is occupied.
+
+**Tradeoffs.** The worker index is advisory, so execution may occur elsewhere. A wake signal prompts a work check; it does not promise that a peer steals a particular task.
+
+**Code and ownership.** Extension wakeup in [`scheduler.cpp`](src/scheduler.cpp#L188) and inherited steal loop in [`scheduler.cpp`](src/scheduler.cpp#L625).
+
+</details>
+
+<a id="technique-exact-once-claim"></a>
+
+<details>
+<summary>Atomic claim and shared-record reclamation</summary>
+
+**Mechanism.** Both queue references reach `Worker::execute()`. A strong compare-and-exchange changes `claimed` from false to true. Only its winner increments the preferred or stolen counter and invokes the body. A loser increments duplicate skips and returns. Each entry owns a `shared_ptr`, so the record and task captures live until both references release them.
+
+**Example.** The consumer checks that each callback count is one and that captures remain alive until duplicate references drain.
+
+**Why here.** Two queue routes can race, so a shared atomic decision prevents duplicate body execution.
+
+**Tradeoffs.** The losing reference must still be dequeued. It can outlive body completion. Shared ownership and an atomic operation add work to each hinted task.
+
+**Code and ownership.** Extension record and claim in [`scheduler.h`](include/marl/scheduler.h#L334) and [`scheduler.cpp`](src/scheduler.cpp#L605). Consumer oracle in [`mn_thread_runtime_tests.cpp`](examples/mn_thread_runtime_tests.cpp#L147).
+
+</details>
+
+<a id="technique-same-thread-task"></a>
+
+<details>
+<summary>Same-thread routing precedence</summary>
+
+**Mechanism.** `Scheduler::enqueue()` checks the `SameThread` flag before the worker hint. It places such a task on the current worker and returns. The thief also refuses to steal ordinary same-thread tasks from a peer queue.
+
+**Example.** A task with `SameThread` and a preferred index still runs on the scheduling thread's worker.
+
+**Why here.** The extension preserves Marl's existing task contract instead of letting a placement hint override it.
+
+**Tradeoffs.** Same-thread work cannot use the normal peer-steal fallback. A caller must schedule it on the thread where it must execute.
+
+**Code and ownership.** Inherited flag in [`task.h`](include/marl/task.h#L30) and routing/steal guard in [`scheduler.cpp`](src/scheduler.cpp#L171) and [`scheduler.cpp`](src/scheduler.cpp#L625). Consumer check in [`mn_thread_runtime_tests.cpp`](examples/mn_thread_runtime_tests.cpp#L129).
+
+</details>
+
+<a id="technique-affinity-counter"></a>
+
+<details>
+<summary>Cumulative placement counters</summary>
+
+**Mechanism.** The scheduler keeps atomic cumulative counts for bodies claimed by the preferred worker, claimed by another worker, and duplicate entries skipped. `affinityStats()` loads them into a snapshot. It does not wait for all queue references for completed tasks to drain.
+
+**Example.** After a task body completes, duplicate skips may remain unchanged until the losing entry is consumed.
+
+**Why here.** The consumer can classify where task bodies ran and check whether losing references eventually drain.
+
+**Tradeoffs.** These are cumulative snapshots, not per-task live states. Duplicate skips can lag body completion. The counters do not measure cache misses, NUMA placement, or performance.
+
+**Code and ownership.** Extension counters and snapshot in [`scheduler.h`](include/marl/scheduler.h#L51) and [`scheduler.cpp`](src/scheduler.cpp#L222). Consumer drain check in [`mn_thread_runtime_tests.cpp`](examples/mn_thread_runtime_tests.cpp#L207).
+
+</details>
+
+<a id="technique-shutdown-drain"></a>
+
+<details>
+<summary>Shutdown drain</summary>
+
+**Mechanism.** A worker keeps its run loop active while shutdown is requested and queued work or blocked fibers remain. Workers process queue entries, including stale duplicate references, before joining. The scheduler destructor waits for bound single-thread workers to unbind, then stops and destroys worker threads.
+
+**Example.** The consumer fills the preferred worker's mailbox while peers steal and run normal queue references, then releases its blocker and destroys the scheduler.
+
+**Why here.** Draining both entries releases task captures and lets accepted callbacks finish before worker teardown.
+
+**Tradeoffs.** Teardown waits for outstanding work and bound threads. A task that never returns or a caller that never unbinds can prevent shutdown from completing.
+
+**Code and ownership.** Inherited worker lifecycle in [`scheduler.cpp`](src/scheduler.cpp#L659) and [`scheduler.cpp`](src/scheduler.cpp#L151). Consumer check in [`mn_thread_runtime_tests.cpp`](examples/mn_thread_runtime_tests.cpp#L235).
+
+</details>
+
+<a id="technique-consumer-stressor-oracle"></a>
+
+<details>
+<summary>Exact consumer stressor oracle</summary>
+
+**Mechanism.** The maintained executable controls contention with a blocker, submits a known task count, and checks per-task atomic counts, placement classification, reference-drain counts, and capture destruction. Its stencil path also compares parallel output with a serial checksum and checks hinted executions against the scheduler counter.
+
+**Example.** `testAffinityStealRace()` holds the preferred worker while 128 hinted callbacks run through a peer, then requires every callback count to equal one and all 129 duplicate references to be skipped.
+
+**Why here.** The oracle checks callback ownership and reclamation in the real consumer executable.
+
+**Tradeoffs.** Time-bounded stress tests cover controlled races, not every interleaving. The stencil checksum proves result agreement for its inputs, not locality or speedup.
+
+**Code and ownership.** Repository consumer checks in [`mn_thread_runtime_tests.cpp`](examples/mn_thread_runtime_tests.cpp#L147), [`mn_thread_runtime_tests.cpp`](examples/mn_thread_runtime_tests.cpp#L235), and [`mn_thread_runtime_tests.cpp`](examples/mn_thread_runtime_tests.cpp#L326).
+
+</details>
 
 ### Follow a hinted task
 
